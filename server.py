@@ -137,6 +137,32 @@ def md_cell(text, limit=400):
     return text.replace("|", "\\|").replace("\n", "<br>").replace("\r", "")
 
 
+# Appended to the copied config.py: secrets contain server-only paths
+# (e.g. /var/app/current/ssl/poolbrain.pem); remap them to files that exist
+# next to the source tree so the app can boot locally.
+CONFIG_LOCAL_SHIM = '''
+
+# --- appended by branch-compare: remap EC2-only file paths to local ones ---
+_bc_orig_init = init
+def init():
+    import os as _os
+    env = _bc_orig_init()
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    fallbacks = {"cert_file": "ssl.cert", "key_file": "ssl.key",
+                 "cert_file_socket": "ssl.cert", "key_file_socket": "ssl.key"}
+    for key, legacy in fallbacks.items():
+        v = env.get(key)
+        if v and not _os.path.exists(v):
+            for cand in (_os.path.join(here, "ssl", _os.path.basename(v)),
+                         _os.path.join(here, _os.path.basename(v)),
+                         _os.path.join(here, legacy)):
+                if _os.path.exists(cand):
+                    env[key] = cand
+                    break
+    return env
+'''
+
+
 # ---------------------------------------------------------------- job runner
 
 class Job:
@@ -209,8 +235,8 @@ class BranchServer:
         if not cfg_src.exists():
             cfg_src = self.repo / "envs_test" / "api" / "config.py"
         if cfg_src.exists():
-            (src / "config.py").write_text(cfg_src.read_text())
-            job.emit(f"[{branch}] Copied envs_test/api/config.py → src/config.py")
+            (src / "config.py").write_text(cfg_src.read_text() + CONFIG_LOCAL_SHIM)
+            job.emit(f"[{branch}] Copied envs_test/api/config.py → src/config.py (+ local path shim)")
         else:
             job.emit(f"[{branch}] envs_test/api/config.py not found — skipping config copy", "warn")
 
@@ -262,7 +288,8 @@ class BranchServer:
                 text = self.log_file.read_text(errors="replace") if self.log_file.exists() else ""
                 found = url_re.findall(text)
                 if found:
-                    base = found[-1].replace("://0.0.0.0", "://127.0.0.1")
+                    local = [u for u in found if "127.0.0.1" in u]
+                    base = (local[-1] if local else found[-1]).replace("://0.0.0.0", "://127.0.0.1")
             if base:
                 try:
                     rq.get(base + "/health_check", verify=False, timeout=5)
