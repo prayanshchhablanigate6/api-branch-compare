@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Branch Compare · API Response Diff</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="logo">⇄</div>
+    <div>
+      <h1>Branch Compare</h1>
+      <p>Replay logged API requests on two branches &amp; diff the responses</p>
+    </div>
+  </div>
+  <div class="topbar-status" id="topbarStatus"></div>
+</header>
+
+<main id="wizard">
+
+  <!-- STEP 1 · Repository -->
+  <section class="card" id="step-repo">
+    <div class="card-head">
+      <span class="step-num">1</span>
+      <div><h2>Target repository</h2><p>The git repo whose API server will be run on each branch</p></div>
+    </div>
+    <div class="field">
+      <label for="repoInput">Repository path</label>
+      <div class="combo">
+        <input id="repoInput" type="text" spellcheck="false" autocomplete="off"
+               placeholder="/Users/you/work/your-api-repo" value="/Users/prayanshchhablani/work/poolbrain-mobileapi">
+        <div class="combo-list" id="repoSuggest"></div>
+      </div>
+    </div>
+    <div id="repoMeta" class="meta-grid hidden"></div>
+  </section>
+
+  <!-- STEP 2 · Request logs -->
+  <section class="card" id="step-files">
+    <div class="card-head">
+      <span class="step-num">2</span>
+      <div><h2>Request logs</h2><p>Upload one or more JSON log files (GetRequestLogs.json / PostRequestLogs.json format)</p></div>
+    </div>
+    <div class="dropzone" id="dropzone">
+      <input type="file" id="fileInput" accept=".json,application/json" multiple hidden>
+      <div class="dz-inner">
+        <div class="dz-icon">📄</div>
+        <p><strong>Drop JSON files here</strong> or <span class="link">browse</span></p>
+        <p class="dz-hint">Each entry needs <code>uri</code>, <code>method</code>, <code>headers</code>, <code>params</code> / <code>request</code></p>
+      </div>
+    </div>
+    <div id="fileList" class="file-list"></div>
+  </section>
+
+  <!-- STEP 3 · Branches -->
+  <section class="card" id="step-branches">
+    <div class="card-head">
+      <span class="step-num">3</span>
+      <div><h2>Branches to compare</h2><p>Requests run on branch A first, then branch B — sequentially</p></div>
+    </div>
+    <div class="branch-row">
+      <div class="field">
+        <label>Branch A <span class="tag tag-a">baseline</span></label>
+        <div class="combo">
+          <input class="branch-input" id="branchA" placeholder="select branch…" autocomplete="off" spellcheck="false" disabled>
+          <div class="combo-list" id="branchAList"></div>
+        </div>
+      </div>
+      <button class="swap-btn" id="swapBtn" title="Swap branches">⇄</button>
+      <div class="field">
+        <label>Branch B <span class="tag tag-b">candidate</span></label>
+        <div class="combo">
+          <input class="branch-input" id="branchB" placeholder="select branch…" autocomplete="off" spellcheck="false" disabled>
+          <div class="combo-list" id="branchBList"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- STEP 4 · Advanced -->
+  <section class="card collapsible collapsed" id="step-advanced">
+    <button class="card-head as-toggle" id="advToggle">
+      <span class="step-num">4</span>
+      <div><h2>Advanced settings <span class="chev">▾</span></h2><p>Optional — sensible defaults are auto-detected</p></div>
+    </button>
+    <div class="adv-body">
+      <div class="adv-grid">
+        <div class="field">
+          <label for="serverCmd">Server command <span class="hint">"python" = repo venv python · cwd is <code>src/</code></span></label>
+          <input id="serverCmd" type="text" placeholder="auto-detect (python api.py)" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="baseUrl">Base URL override <span class="hint">otherwise parsed from server output</span></label>
+          <input id="baseUrl" type="text" placeholder="https://127.0.0.1:4000" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="startupTimeout">Server startup timeout (s)</label>
+          <input id="startupTimeout" type="number" value="180" min="10">
+        </div>
+        <div class="field">
+          <label for="requestTimeout">Per-request timeout (s)</label>
+          <input id="requestTimeout" type="number" value="120" min="5">
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="run-bar">
+    <div class="run-summary" id="runSummary">Pick a repo, upload logs and choose two branches to begin</div>
+    <button class="run-btn" id="runBtn" disabled>▶ &nbsp;Run comparison</button>
+  </div>
+
+  <!-- PROGRESS -->
+  <section class="card hidden" id="progressCard">
+    <div class="card-head">
+      <span class="step-num pulse" id="progNum">⚙</span>
+      <div><h2 id="progTitle">Running…</h2><p id="progSub"></p></div>
+    </div>
+    <div class="branch-pipelines" id="pipelines"></div>
+    <div class="progress-track"><div class="progress-fill" id="progFill"></div></div>
+    <pre class="console" id="console"></pre>
+  </section>
+
+  <!-- REPORT -->
+  <section class="card hidden" id="reportCard">
+    <div class="card-head">
+      <span class="step-num done">✓</span>
+      <div><h2>Comparison report</h2><p id="reportMeta"></p></div>
+      <a class="dl-btn" id="dlBtn" href="#">⬇ &nbsp;Download report.md</a>
+    </div>
+    <div class="summary-chips" id="summaryChips"></div>
+    <div class="filter-row">
+      <input id="filterInput" type="text" placeholder="filter by route…" spellcheck="false">
+      <label class="check"><input type="checkbox" id="diffOnly"> differences only</label>
+    </div>
+    <div class="table-wrap">
+      <table class="report-table" id="reportTable">
+        <thead><tr>
+          <th>#</th><th>Route</th><th>Request</th>
+          <th id="thA">Branch A</th><th id="thB">Branch B</th><th>Match</th>
+        </tr></thead>
+        <tbody id="reportBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">Branch Compare · runs each branch in an isolated git worktree — your working copy stays untouched</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
