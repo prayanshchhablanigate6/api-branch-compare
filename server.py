@@ -55,12 +55,60 @@ def is_git_repo(path):
 
 
 def find_venv_python(repo):
+    """Pick a virtualenv python for the target app.
+
+    Strategy:
+      1. Collect candidate venvs from inside the repo and from sibling repos
+         under the repo's parent directory.
+      2. Prefer the one that can actually `import stripe` (and a couple of
+         other commonly-required modules) — the app's hard third-party deps.
+         If none qualify, fall back to the first existing candidate.
+    """
     repo = Path(repo)
-    for cand in ("src/.venv/bin/python", ".venv/bin/python", "venv/bin/python", "src/venv/bin/python"):
-        p = repo / cand
-        if p.exists():
-            return p
-    return None
+    rel_paths = (
+        "src/.venv/bin/python", ".venv/bin/python",
+        "venv/bin/python", "src/venv/bin/python",
+    )
+    candidates = []
+    seen = set()
+
+    def add(p):
+        try:
+            rp = p.resolve()
+        except OSError:
+            return
+        if rp in seen or not p.exists():
+            return
+        seen.add(rp)
+        candidates.append(p)
+
+    for rel in rel_paths:
+        add(repo / rel)
+    # Sibling repos under the same parent (e.g. ~/work/<other-repo>/src/.venv).
+    parent = repo.parent
+    if parent.exists():
+        for sibling in parent.iterdir():
+            if not sibling.is_dir() or sibling == repo:
+                continue
+            for rel in rel_paths:
+                add(sibling / rel)
+
+    if not candidates:
+        return None
+
+    # Probe candidates for the modules the target app needs at import time.
+    probe = "import stripe, ddtrace, botocore"
+    for py in candidates:
+        try:
+            r = subprocess.run([str(py), "-c", probe],
+                               capture_output=True, text=True, timeout=8)
+            if r.returncode == 0:
+                return py
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+    # Nothing fully qualified — just return the first existing candidate so the
+    # caller can surface a useful error later.
+    return candidates[0]
 
 
 def python_version(py):
@@ -139,10 +187,14 @@ def md_cell(text, limit=400):
 
 # Appended to the copied config.py: secrets contain server-only paths
 # (e.g. /var/app/current/ssl/poolbrain.pem); remap them to files that exist
-# next to the source tree so the app can boot locally.
+# next to the source tree so the app can boot locally. Also force the listen
+# port to whatever branch-compare assigned (load_secrets() above blows away
+# PORT/SOCKET_PORT with values from AWS Secrets Manager, so we use a separate
+# env var name that secrets will never touch).
 CONFIG_LOCAL_SHIM = '''
 
-# --- appended by branch-compare: remap EC2-only file paths to local ones ---
+# --- appended by branch-compare: remap EC2-only file paths to local ones
+# and pin the listen port to the BC_PORT we injected ---
 _bc_orig_init = init
 def init():
     import os as _os
@@ -159,6 +211,14 @@ def init():
                 if _os.path.exists(cand):
                     env[key] = cand
                     break
+    # Force the per-branch port assigned by branch-compare. AWS secrets
+    # overwrite PORT/SOCKET_PORT during load_secrets(), so we use BC_*.
+    bc_port = _os.environ.get("BC_PORT")
+    if bc_port:
+        env["port"] = int(bc_port)
+    bc_sock = _os.environ.get("BC_SOCKET_PORT")
+    if bc_sock:
+        env["socketPort"] = bc_sock
     return env
 '''
 
@@ -166,23 +226,42 @@ def init():
 # ---------------------------------------------------------------- job runner
 
 class Job:
-    def __init__(self, cfg):
+    def __init__(self, cfg, prior_results=None, start_index=0):
         self.id = uuid.uuid4().hex[:12]
         self.cfg = cfg
         self.status = "queued"
         self.error = None
         self.log = []
-        self.progress = {"phase": "queued", "branch": None, "done": 0, "total": len(cfg["requests"])}
+        # Carry over results from a previous stopped job when resuming, and
+        # skip the matching number of specs at the head of cfg['requests'].
+        self.results = list(prior_results or [])
+        self.start_index = int(start_index or 0)
+        self.progress = {
+            "phase": "queued", "branch": None,
+            "done": len(self.results), "total": len(cfg["requests"]),
+        }
         self.branch_state = {b: {"status": "pending", "error": None, "base_url": None}
                              for b in (cfg["branch_a"], cfg["branch_b"])}
-        self.results = []
         self.dir = RUNS_DIR / self.id
         self.dir.mkdir(parents=True, exist_ok=True)
         self.report_path = None
+        # Control flags. pause_event SET = running; CLEARED = paused.
+        # cancel_event SET = stop requested.
+        self.pause_event = threading.Event()
+        self.pause_event.set()
+        self.cancel_event = threading.Event()
 
     def emit(self, msg, level="info"):
         line = {"t": datetime.now().strftime("%H:%M:%S"), "level": level, "msg": msg}
         self.log.append(line)
+
+    @property
+    def paused(self):
+        return not self.pause_event.is_set()
+
+    @property
+    def cancelled(self):
+        return self.cancel_event.is_set()
 
     def to_dict(self):
         return {
@@ -190,6 +269,9 @@ class Job:
             "log": self.log, "progress": self.progress,
             "branches": self.branch_state, "results": self.results,
             "report_ready": self.report_path is not None,
+            "paused": self.paused, "cancelled": self.cancelled,
+            "can_resume": self.status in ("stopped", "error")
+                          and len(self.results) < len(self.cfg["requests"]),
         }
 
 
@@ -205,10 +287,18 @@ def wait_port_free(host, port, job, timeout=30):
     return False
 
 
+def pick_free_port():
+    """Ask the OS for an unused TCP port. Tiny TOCTOU window, but plenty
+    good for handing out one port per branch."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 class BranchServer:
     """Starts the target API server for one branch inside an isolated worktree."""
 
-    def __init__(self, job, branch):
+    def __init__(self, job, branch, port=None, socket_port=None):
         self.job = job
         self.branch = branch
         self.cfg = job.cfg
@@ -216,7 +306,11 @@ class BranchServer:
         safe = re.sub(r"[^A-Za-z0-9._-]+", "-", branch)
         self.worktree = job.dir / f"wt-{safe}"
         self.proc = None
-        self.base_url = None
+        self.port = port
+        self.socket_port = socket_port
+        # When we assign a port ourselves we also know the base URL up front,
+        # so we don't need to scrape it from the server's stdout.
+        self.base_url = f"http://127.0.0.1:{port}" if port else None
         self.log_file = job.dir / f"server-{safe}.log"
 
     def setup(self):
@@ -265,6 +359,18 @@ class BranchServer:
 
         env = dict(os.environ)
         env.setdefault("PYTHONUNBUFFERED", "1")
+        # Force a unique port per branch so the two servers don't collide on
+        # whatever the repo's default PORT happens to be. We use BC_PORT (not
+        # PORT) because some apps load secrets via os.environ.update(...) and
+        # that would clobber PORT — the config shim reads BC_PORT.
+        if self.port:
+            env["BC_PORT"] = str(self.port)
+            env["BC_SOCKET_PORT"] = str(self.socket_port or self.port + 1)
+            # Also set PORT/SOCKET_PORT as a fallback for apps that read them
+            # directly without going through the config shim.
+            env["PORT"] = env["BC_PORT"]
+            env["SOCKET_PORT"] = env["BC_SOCKET_PORT"]
+            job.emit(f"[{branch}] Assigned BC_PORT={self.port} BC_SOCKET_PORT={env['BC_SOCKET_PORT']}")
         logf = open(self.log_file, "w")
         self.proc = subprocess.Popen(
             cmd, cwd=str(src), env=env,
@@ -278,26 +384,33 @@ class BranchServer:
         override = (self.cfg.get("base_url") or "").strip().rstrip("/")
         timeout = int(self.cfg.get("startup_timeout") or 180)
         end = time.time() + timeout
-        url_re = re.compile(r"Running on (https?://[\d.]+:\d+)")
+        url_re = re.compile(r"Running on (https?(?://|\+unix://|s://)?[\d.]+:\d+)")
+        # Some apps (this one included) serve over HTTPS with a self-signed
+        # cert. Probe both schemes when the port is known.
+        candidate_schemes = ("http", "https") if self.port else None
         while time.time() < end:
             if self.proc.poll() is not None:
                 tail = self._log_tail()
                 raise RuntimeError(f"server exited with code {self.proc.returncode}\n{tail}")
-            base = override
+            base = override or self.base_url
             if not base:
                 text = self.log_file.read_text(errors="replace") if self.log_file.exists() else ""
-                found = url_re.findall(text)
+                found = re.findall(r"Running on (https?://[\d.]+:\d+)", text)
                 if found:
                     local = [u for u in found if "127.0.0.1" in u]
                     base = (local[-1] if local else found[-1]).replace("://0.0.0.0", "://127.0.0.1")
             if base:
-                try:
-                    rq.get(base + "/health_check", verify=False, timeout=5)
-                    self.base_url = base
-                    job.emit(f"[{branch}] Server is up at {base}", "ok")
-                    return
-                except rq.RequestException:
-                    pass
+                tried = [base] if not candidate_schemes else [
+                    f"{s}://127.0.0.1:{self.port}" for s in candidate_schemes
+                ]
+                for url in tried:
+                    try:
+                        rq.get(url + "/health_check", verify=False, timeout=5)
+                        self.base_url = url
+                        job.emit(f"[{branch}] Server is up at {url}", "ok")
+                        return
+                    except rq.RequestException:
+                        pass
             time.sleep(1.5)
         raise RuntimeError(f"server did not become ready within {timeout}s\n{self._log_tail()}")
 
@@ -353,73 +466,57 @@ class BranchServer:
             self.job.emit(f"[{self.branch}] Worktree removed")
 
 
-def run_branch(job, branch):
-    """Run all requests against one branch; returns list of per-request results."""
+def _bring_up(job, branch, server):
+    """Worktree + start one branch's server. Marks state on success or failure."""
     state = job.branch_state[branch]
-    server = BranchServer(job, branch)
-    out = []
     try:
         state["status"] = "setup"
-        job.progress.update(phase="setup", branch=branch, done=0)
         server.setup()
         state["status"] = "starting"
-        job.progress["phase"] = "starting"
         server.start()
         state["base_url"] = server.base_url
         state["status"] = "running"
-        job.progress["phase"] = "requests"
-        for i, spec in enumerate(job.cfg["requests"]):
-            job.progress["done"] = i
-            res = server.replay(spec)
-            tag = "ok" if res["ok"] and (res["status"] or 0) < 500 else "warn"
-            job.emit(f"[{branch}] {spec['method']} {spec['uri']} → {res['status']} ({res['time_ms']} ms)", tag)
-            out.append(res)
-        job.progress["done"] = len(job.cfg["requests"])
-        state["status"] = "done"
     except Exception as e:
         state["status"] = "failed"
         state["error"] = str(e)
         job.emit(f"[{branch}] FAILED: {e}", "error")
-        missing = len(job.cfg["requests"]) - len(out)
-        out += [{"ok": False, "status": None, "time_ms": 0,
-                 "body": f"BRANCH FAILED: {e}"}] * missing
-    finally:
-        server.stop()
-        server.cleanup()
-    return out
 
 
-def build_report(job, res_a, res_b):
+def _row_for(spec, ra, rb):
+    same_status = ra["status"] == rb["status"]
+    same_body = normalize_body(ra["body"]) == normalize_body(rb["body"])
+    req_repr = spec["body"] if spec["body"] else json.dumps(spec["params"]) if spec["params"] else ""
+    return {
+        "route": spec["uri"], "method": spec["method"], "request": req_repr,
+        "source": spec["source"], "match": bool(same_status and same_body),
+        "a": {"status": ra["status"], "time_ms": ra["time_ms"], "body": ra["body"]},
+        "b": {"status": rb["status"], "time_ms": rb["time_ms"], "body": rb["body"]},
+    }
+
+
+def render_report_md(job):
+    """Render the current job.results to a markdown string. Pure — safe to
+    call mid-run from a request thread."""
     cfg = job.cfg
     a, b = cfg["branch_a"], cfg["branch_b"]
-    rows, matches = [], 0
-    for spec, ra, rb in zip(cfg["requests"], res_a, res_b):
-        same_status = ra["status"] == rb["status"]
-        same_body = normalize_body(ra["body"]) == normalize_body(rb["body"])
-        match = bool(same_status and same_body)
-        matches += match
-        req_repr = spec["body"] if spec["body"] else json.dumps(spec["params"]) if spec["params"] else ""
-        rows.append({
-            "route": spec["uri"], "method": spec["method"],
-            "request": req_repr, "source": spec["source"],
-            "a": ra, "b": rb, "match": match,
-        })
-        job.results.append({
-            "route": spec["uri"], "method": spec["method"], "request": req_repr,
-            "source": spec["source"], "match": match,
-            "a": {"status": ra["status"], "time_ms": ra["time_ms"], "body": ra["body"]},
-            "b": {"status": rb["status"], "time_ms": rb["time_ms"], "body": rb["body"]},
-        })
-
+    rows = list(job.results)  # snapshot
     total = len(rows)
+    matches = sum(1 for r in rows if r["match"])
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    in_progress = job.status == "running"
+    header_suffix = " (partial)" if in_progress else ""
     md = [
-        "# API Branch Comparison Report",
+        f"# API Branch Comparison Report{header_suffix}",
         "",
         f"- **Repository:** `{cfg['repo']}`",
         f"- **Branches:** `{a}` vs `{b}`",
         f"- **Generated:** {ts}",
-        f"- **Requests:** {total} &nbsp;|&nbsp; ✅ matching: {matches} &nbsp;|&nbsp; ❌ differing: {total - matches}",
+        f"- **Requests:** {total} of {job.progress.get('total', total)}"
+        f" &nbsp;|&nbsp; ✅ matching: {matches} &nbsp;|&nbsp; ❌ differing: {total - matches}",
+    ]
+    if in_progress:
+        md.append(f"- **Status:** in progress — export reflects rows completed so far")
+    md += [
         "",
         f"| # | Route | Method | Request | Response by `{a}` | Response by `{b}` | Match |",
         "|---|-------|--------|---------|---------|---------|:-----:|",
@@ -444,31 +541,123 @@ def build_report(job, res_a, res_b):
                 "```json", (r["b"]["body"] or "(empty)")[:8000], "```",
                 "",
             ]
+    return "\n".join(md)
 
+
+def write_report(job):
+    """Persist report.md + results.json to disk."""
     path = job.dir / "report.md"
-    path.write_text("\n".join(md))
+    path.write_text(render_report_md(job))
     job.report_path = path
     (job.dir / "results.json").write_text(json.dumps(job.results, indent=2))
     job.emit(f"Report written → {path}", "ok")
 
 
 def run_job(job):
+    """Bring up both branches in parallel, then replay each request on both
+    simultaneously, streaming each row into job.results as soon as it lands."""
     cfg = job.cfg
+    a, b = cfg["branch_a"], cfg["branch_b"]
+    # Pre-pick non-colliding ports so both branches' servers can coexist.
+    port_a, port_b = pick_free_port(), pick_free_port()
+    while port_b == port_a:
+        port_b = pick_free_port()
+    servers = {
+        a: BranchServer(job, a, port=port_a, socket_port=pick_free_port()),
+        b: BranchServer(job, b, port=port_b, socket_port=pick_free_port()),
+    }
     try:
         job.status = "running"
-        job.emit(f"Comparing '{cfg['branch_a']}' vs '{cfg['branch_b']}' on {cfg['repo']} "
-                 f"({len(cfg['requests'])} requests)")
-        res_a = run_branch(job, cfg["branch_a"])
-        res_b = run_branch(job, cfg["branch_b"])
+        job.emit(f"Comparing '{a}' vs '{b}' on {cfg['repo']} "
+                 f"({len(cfg['requests'])} requests, both branches in parallel)")
+
+        # ---- 1. setup + start both branches in parallel
+        job.progress.update(phase="setup", branch=None, done=0)
+        threads = [threading.Thread(target=_bring_up, args=(job, br, servers[br]), daemon=True)
+                   for br in (a, b)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        failed = [br for br in (a, b) if job.branch_state[br]["status"] != "running"]
+        if failed:
+            raise RuntimeError(f"branch(es) failed to start: {', '.join(failed)}")
+
+        # ---- 2. replay each request on both branches in parallel; stream rows
+        job.progress["phase"] = "requests"
+        specs = cfg["requests"]
+        start_at = max(job.start_index, len(job.results))
+        if start_at:
+            job.emit(f"Resuming — skipping first {start_at} requests already completed")
+        for i in range(start_at, len(specs)):
+            # Cancellation: bail out cleanly before issuing the next request.
+            if job.cancelled:
+                job.emit("Stop requested — halting before next request", "warn")
+                break
+            # Pause: block here until resumed (or cancelled).
+            if job.paused:
+                job.emit("Paused", "warn")
+                while not job.pause_event.wait(timeout=0.5):
+                    if job.cancelled:
+                        break
+                if job.cancelled:
+                    job.emit("Stop requested while paused", "warn")
+                    break
+                job.emit("Resumed", "ok")
+
+            spec = specs[i]
+            job.progress["done"] = i
+            results = {}
+
+            def hit(br):
+                results[br] = servers[br].replay(spec)
+
+            ts = [threading.Thread(target=hit, args=(br,)) for br in (a, b)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+
+            ra, rb = results[a], results[b]
+            for br, r in ((a, ra), (b, rb)):
+                tag = "ok" if r["ok"] and (r["status"] or 0) < 500 else "warn"
+                job.emit(f"[{br}] {spec['method']} {spec['uri']} → "
+                         f"{r['status']} ({r['time_ms']} ms)", tag)
+            job.results.append(_row_for(spec, ra, rb))
+
+        job.progress["done"] = len(job.results)
+
+        # ---- 3. final report (always written from whatever results we have)
         job.progress["phase"] = "report"
-        build_report(job, res_a, res_b)
-        job.status = "done"
-        job.progress["phase"] = "done"
-        job.emit("All done 🎉", "ok")
+        write_report(job)
+        if job.cancelled:
+            for br in (a, b):
+                job.branch_state[br]["status"] = "done"
+            job.status = "stopped"
+            job.progress["phase"] = "stopped"
+            job.emit("Run stopped by user — partial report saved", "warn")
+        else:
+            for br in (a, b):
+                job.branch_state[br]["status"] = "done"
+            job.status = "done"
+            job.progress["phase"] = "done"
+            job.emit("All done 🎉", "ok")
     except Exception as e:
         job.status = "error"
         job.error = str(e)
         job.emit(f"Job failed: {e}\n{traceback.format_exc()}", "error")
+    finally:
+        for br, srv in servers.items():
+            try:
+                srv.stop()
+            except Exception as e:
+                job.emit(f"[{br}] stop error: {e}", "warn")
+        for br, srv in servers.items():
+            try:
+                srv.cleanup()
+            except Exception as e:
+                job.emit(f"[{br}] cleanup error: {e}", "warn")
 
 
 # ---------------------------------------------------------------- API routes
@@ -567,13 +756,79 @@ def job_status(job_id):
     return jsonify(job.to_dict())
 
 
+@app.post("/api/job/<job_id>/pause")
+def job_pause(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if job.status != "running":
+        return jsonify({"error": f"cannot pause job in status '{job.status}'"}), 400
+    job.pause_event.clear()
+    return jsonify({"ok": True, "paused": True})
+
+
+@app.post("/api/job/<job_id>/resume")
+def job_resume(job_id):
+    """Resume a currently paused job in place."""
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if job.status != "running" or not job.paused:
+        return jsonify({"error": f"job is not paused (status '{job.status}')"}), 400
+    job.pause_event.set()
+    return jsonify({"ok": True, "paused": False})
+
+
+@app.post("/api/job/<job_id>/stop")
+def job_stop(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if job.status not in ("running", "queued"):
+        return jsonify({"error": f"cannot stop job in status '{job.status}'"}), 400
+    job.cancel_event.set()
+    # Unblock the worker if it's currently parked on a pause.
+    job.pause_event.set()
+    job.emit("Stop requested by user — will halt after current request", "warn")
+    return jsonify({"ok": True})
+
+
+@app.post("/api/job/<job_id>/restart")
+def job_restart(job_id):
+    """Start a fresh job with the same config. With ?resume=1, carry over
+    completed results and skip those specs."""
+    prev = JOBS.get(job_id)
+    if not prev:
+        return jsonify({"error": "unknown job"}), 404
+    if prev.status in ("running", "queued"):
+        return jsonify({"error": "previous job still active — stop it first"}), 400
+    resume = request.args.get("resume") in ("1", "true")
+    prior = prev.results if resume else None
+    start_index = len(prev.results) if resume else 0
+    job = Job(prev.cfg, prior_results=prior, start_index=start_index)
+    with JOBS_LOCK:
+        JOBS[job.id] = job
+    threading.Thread(target=run_job, args=(job,), daemon=True).start()
+    return jsonify({"job_id": job.id, "resumed": resume,
+                    "carried_over": len(prior or [])})
+
+
 @app.get("/api/report/<job_id>.md")
 def report_md(job_id):
+    """Render the report on demand from current job.results. Works mid-run
+    after even a single request has completed."""
     job = JOBS.get(job_id)
-    if not job or not job.report_path:
-        return jsonify({"error": "report not ready"}), 404
-    return send_file(job.report_path, as_attachment=True,
-                     download_name=f"branch-compare-{job.cfg['branch_a']}-vs-{job.cfg['branch_b']}.md")
+    if not job:
+        return jsonify({"error": "unknown job"}), 404
+    if not job.results:
+        return jsonify({"error": "no rows yet — wait for at least one request to complete"}), 404
+    from flask import Response
+    body = render_report_md(job)
+    a, b = job.cfg["branch_a"], job.cfg["branch_b"]
+    suffix = "-partial" if job.status == "running" else ""
+    fname = f"branch-compare-{a}-vs-{b}{suffix}.md"
+    return Response(body, mimetype="text/markdown; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 if __name__ == "__main__":

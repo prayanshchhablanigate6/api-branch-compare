@@ -61,7 +61,7 @@
   <section class="card" id="step-branches">
     <div class="card-head">
       <span class="step-num">3</span>
-      <div><h2>Branches to compare</h2><p>Requests run on branch A first, then branch B — sequentially</p></div>
+      <div><h2>Branches to compare</h2><p>Both branches start in parallel; each request is replayed against both at the same time</p></div>
     </div>
     <div class="branch-row">
       <div class="field">
@@ -91,7 +91,11 @@
     <div class="adv-body">
       <div class="adv-grid">
         <div class="field">
-          <label for="serverCmd">Server command <span class="hint">"python" = repo venv python · cwd is <code>src/</code></span></label>
+          <label for="venvPython">Virtualenv python <span class="hint">absolute path; overrides auto-detect (use this if deps live in another repo's venv)</span></label>
+          <input id="venvPython" type="text" placeholder="auto-detect (repo's src/.venv/bin/python)" spellcheck="false">
+        </div>
+        <div class="field">
+          <label for="serverCmd">Server command <span class="hint">"python" = chosen venv python · cwd is <code>src/</code></span></label>
           <input id="serverCmd" type="text" placeholder="auto-detect (python api.py)" spellcheck="false">
         </div>
         <div class="field">
@@ -120,6 +124,13 @@
     <div class="card-head">
       <span class="step-num pulse" id="progNum">⚙</span>
       <div><h2 id="progTitle">Running…</h2><p id="progSub"></p></div>
+      <div class="run-controls" id="runControls">
+        <button class="ctrl-btn" id="pauseBtn" title="Pause after the current request">⏸ Pause</button>
+        <button class="ctrl-btn" id="resumeBtn" title="Resume" hidden>▶ Resume</button>
+        <button class="ctrl-btn danger" id="stopBtn" title="Stop and tear down servers">■ Stop</button>
+        <button class="ctrl-btn" id="restartBtn" title="Re-run from the beginning" hidden>↻ Restart</button>
+        <button class="ctrl-btn" id="resumeJobBtn" title="Resume from where it stopped" hidden>⏵ Resume run</button>
+      </div>
     </div>
     <div class="branch-pipelines" id="pipelines"></div>
     <div class="progress-track"><div class="progress-fill" id="progFill"></div></div>

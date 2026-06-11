@@ -107,6 +107,9 @@ async function loadRepo() {
         <div class="v ${info.entry ? "ok" : ""}">${info.entry ? "src/" + esc(info.entry) : "auto-detect per branch"}</div></div>
       <div class="meta-item"><div class="k">env config</div>
         <div class="v ${info.has_env_config ? "ok" : "bad"}">${info.has_env_config ? "✓ envs_test/api/config.py" : "✕ envs_test/api/config.py missing"}</div></div>`;
+    // Pre-fill the venv-python override with the auto-detected path so the
+    // user can simply edit it if their deps live in a different venv.
+    if (info.venv_python && !$("venvPython").value) $("venvPython").value = info.venv_python;
     setBranchInputs(true);
     // sensible defaults: dev vs current branch
     if (!state.branchA && info.local_branches.includes("dev")) setBranch("A", "dev");
@@ -120,16 +123,34 @@ async function loadRepo() {
 
 /* ---------------- step 2: files ---------------- */
 const dz = $("dropzone");
-dz.addEventListener("click", () => $("fileInput").click());
-$("fileInput").addEventListener("change", (e) => addFiles([...e.target.files]));
+const fileInput = $("fileInput");
+// Only the dropzone itself should open the picker — ignore clicks bubbling
+// from the hidden <input> (programmatic .click() bubbles too, which caused a
+// re-entrant open/cancel cycle that made the picker appear to do nothing).
+dz.addEventListener("click", (e) => {
+  if (e.target === fileInput) return;
+  fileInput.click();
+});
+fileInput.addEventListener("change", (e) => {
+  addFiles([...e.target.files]).catch(showFileError);
+  e.target.value = ""; // allow re-selecting the same file later
+});
 ["dragover", "dragenter"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
 ["dragleave", "drop"].forEach((ev) => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
-dz.addEventListener("drop", (e) => addFiles([...e.dataTransfer.files]));
+dz.addEventListener("drop", (e) => addFiles([...e.dataTransfer.files]).catch(showFileError));
+
+function showFileError(err) {
+  console.error("[upload]", err);
+  $("fileList").innerHTML =
+    `<div class="file-pill"><span>⚠️</span><span class="err">upload failed: ${esc(err.message || err)}</span></div>`;
+}
 
 async function addFiles(files) {
+  if (!files.length) return;
   for (const f of files) {
     if (state.files.some((x) => x.name === f.name)) continue;
-    state.files.push({ name: f.name, content: await f.text() });
+    const content = await f.text();
+    state.files.push({ name: f.name, content });
   }
   await reparse();
 }
@@ -145,6 +166,7 @@ async function reparse() {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ files: state.files }),
   });
+  if (!r.ok) throw new Error(`/api/parse returned HTTP ${r.status}`);
   state.parsed = await r.json();
   renderFiles();
   updateRunBar();
@@ -222,6 +244,7 @@ $("runBtn").addEventListener("click", async () => {
     repo: state.repo.repo,
     branch_a: state.branchA, branch_b: state.branchB,
     requests: state.parsed.requests,
+    venv_python: $("venvPython").value.trim(),
     server_cmd: $("serverCmd").value.trim(),
     base_url: $("baseUrl").value.trim(),
     startup_timeout: +$("startupTimeout").value || 180,
@@ -233,8 +256,18 @@ $("runBtn").addEventListener("click", async () => {
   const data = await r.json();
   if (data.error) { alert(data.error); updateRunBar(); return; }
   state.jobId = data.job_id;
+  reportRows = [];
+  $("reportBody").innerHTML = "";
   $("progressCard").classList.remove("hidden");
-  $("reportCard").classList.add("hidden");
+  // Show the report card immediately so rows can stream in as each request
+  // finishes on both branches. The download button + summary chips fill in
+  // once the job actually completes.
+  $("reportCard").classList.remove("hidden");
+  $("dlBtn").classList.add("hidden");
+  $("thA").textContent = `Response · ${state.branchA}`;
+  $("thB").textContent = `Response · ${state.branchB}`;
+  $("reportMeta").textContent = `${state.branchA} vs ${state.branchB} · streaming…`;
+  $("summaryChips").innerHTML = "";
   $("progressCard").scrollIntoView({ behavior: "smooth" });
   state.poller = setInterval(poll, 900);
   poll();
@@ -244,10 +277,87 @@ async function poll() {
   const r = await fetch(`/api/job/${state.jobId}`);
   const job = await r.json();
   renderProgress(job);
-  if (job.status === "done" || job.status === "error") {
-    clearInterval(state.poller);
-    if (job.status === "done") renderReport(job);
+  updateControls(job);
+  // Stream rows into the report table as soon as each request completes on
+  // both branches. The backend appends to job.results in order, so we only
+  // need to draw the new tail.
+  if (Array.isArray(job.results) && job.results.length > reportRows.length) {
+    reportRows = job.results;
+    drawRows();
+    updateLiveSummary();
   }
+  // The download button is wired up the moment we have at least one row,
+  // so users can export the partial report mid-run.
+  if (reportRows.length > 0) {
+    const dl = $("dlBtn");
+    dl.href = `/api/report/${state.jobId}.md`;
+    dl.classList.remove("hidden");
+    dl.textContent = job.status === "done"
+      ? "⬇  Download report.md"
+      : `⬇  Export report.md (${reportRows.length} so far)`;
+  }
+  if (job.status === "done" || job.status === "error" || job.status === "stopped") {
+    clearInterval(state.poller);
+    state.poller = null;
+    if (job.status === "done" || job.status === "stopped") renderReport(job);
+  }
+}
+
+/* ---------------- run controls (pause / resume / stop / restart) ---------------- */
+function updateControls(job) {
+  const running = job.status === "running";
+  const stopped = job.status === "stopped" || job.status === "error";
+  $("pauseBtn").hidden = !running || job.paused;
+  $("resumeBtn").hidden = !running || !job.paused;
+  $("stopBtn").hidden = !running;
+  $("restartBtn").hidden = !(stopped || job.status === "done");
+  $("resumeJobBtn").hidden = !job.can_resume;
+}
+
+async function jobAction(path, opts = {}) {
+  if (!state.jobId) return null;
+  const r = await fetch(`/api/job/${state.jobId}${path}`, { method: "POST", ...opts });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) alert(data.error || `Request failed: ${r.status}`);
+  return data;
+}
+
+function startPolling() {
+  if (state.poller) return;
+  state.poller = setInterval(poll, 900);
+  poll();
+}
+
+$("pauseBtn").addEventListener("click", () => jobAction("/pause").then(poll));
+$("resumeBtn").addEventListener("click", () => jobAction("/resume").then(poll));
+$("stopBtn").addEventListener("click", () => {
+  if (!confirm("Stop the run? Servers will be torn down. A partial report will be saved.")) return;
+  jobAction("/stop").then(poll);
+});
+
+async function startFollowUpJob(path) {
+  const data = await jobAction(path);
+  if (!data || !data.job_id) return;
+  state.jobId = data.job_id;
+  reportRows = [];
+  $("reportBody").innerHTML = "";
+  $("reportCard").classList.remove("hidden");
+  $("dlBtn").classList.add("hidden");
+  $("reportMeta").textContent = `${state.branchA} vs ${state.branchB} · streaming…`;
+  $("summaryChips").innerHTML = "";
+  $("progressCard").scrollIntoView({ behavior: "smooth" });
+  startPolling();
+}
+
+$("restartBtn").addEventListener("click", () => startFollowUpJob("/restart"));
+$("resumeJobBtn").addEventListener("click", () => startFollowUpJob("/restart?resume=1"));
+
+function updateLiveSummary() {
+  const matches = reportRows.filter((r) => r.match).length;
+  $("summaryChips").innerHTML = `
+    <span class="chip">Done <b>${reportRows.length}</b></span>
+    <span class="chip c-ok">✅ Matching <b>${matches}</b></span>
+    <span class="chip c-bad">❌ Differing <b>${reportRows.length - matches}</b></span>`;
 }
 
 function renderProgress(job) {
@@ -260,23 +370,31 @@ function renderProgress(job) {
     const cls = st.status === "failed" ? "fail" : st.status === "done" ? "ok"
               : st.status === "pending" ? "" : "active";
     let detail = phaseLabel[st.status] || st.status;
-    if (st.status === "running" && job.progress.branch === b) detail = `replaying requests · ${job.progress.done}/${total}`;
+    // Requests now run on both branches in parallel, so the per-branch detail
+    // line shows the shared progress counter once we're in the requests phase.
+    if (st.status === "running" && job.progress.phase === "requests") {
+      detail = `replaying requests · ${job.progress.done}/${total}`;
+    }
     if (st.base_url) detail += ` · ${st.base_url}`;
     if (st.error) detail = `✗ ${st.error.split("\n")[0]}`;
     return `<div class="pipe ${cls}"><div class="pname"><span class="dot"></span>${esc(b)}</div>
             <div class="pstate">${esc(detail)}</div></div>`;
   }).join("");
 
-  const idx = branches.indexOf(job.progress.branch);
-  const frac = job.status === "done" ? 1
-    : Math.max(0, idx) / branches.length + (job.progress.done / total) / branches.length;
+  // Single shared progress bar (both branches advance together).
+  const frac = job.status === "done" ? 1 : (job.progress.done || 0) / total;
   $("progFill").style.width = (frac * 100).toFixed(1) + "%";
 
   $("progTitle").textContent = job.status === "done" ? "Run complete"
-    : job.status === "error" ? "Run failed" : "Running…";
+    : job.status === "stopped" ? "Run stopped"
+    : job.status === "error" ? "Run failed"
+    : job.paused ? "Paused"
+    : "Running…";
   $("progSub").textContent = job.error || "";
-  $("progNum").classList.toggle("pulse", job.status === "running");
+  $("progNum").classList.toggle("pulse", job.status === "running" && !job.paused);
   if (job.status === "done") { $("progNum").classList.add("done"); $("progNum").textContent = "✓"; }
+  else if (job.status === "stopped") { $("progNum").classList.remove("done"); $("progNum").textContent = "■"; }
+  else if (job.paused) { $("progNum").textContent = "⏸"; }
 
   const con = $("console");
   const stick = con.scrollHeight - con.scrollTop - con.clientHeight < 40;
@@ -295,7 +413,10 @@ function renderReport(job) {
   $("thA").textContent = `Response · ${a}`;
   $("thB").textContent = `Response · ${b}`;
   $("reportMeta").textContent = `${a} vs ${b} · ${reportRows.length} requests`;
-  $("dlBtn").href = `/api/report/${state.jobId}.md`;
+  if (job.report_ready) {
+    $("dlBtn").href = `/api/report/${state.jobId}.md`;
+    $("dlBtn").classList.remove("hidden");
+  }
   $("summaryChips").innerHTML = `
     <span class="chip">Total <b>${reportRows.length}</b></span>
     <span class="chip c-ok">✅ Matching <b>${matches}</b></span>
