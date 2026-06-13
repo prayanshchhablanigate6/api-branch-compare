@@ -44,15 +44,69 @@
   <section class="card" id="step-files">
     <div class="card-head">
       <span class="step-num">2</span>
-      <div><h2>Request logs</h2><p>Upload one or more JSON log files (GetRequestLogs.json / PostRequestLogs.json format)</p></div>
+      <div><h2>Request logs</h2><p>Upload JSON log files <em>or</em> paste a JSON request inline</p></div>
     </div>
-    <div class="dropzone" id="dropzone">
-      <input type="file" id="fileInput" accept=".json,application/json" multiple hidden>
-      <div class="dz-inner">
-        <div class="dz-icon">📄</div>
-        <p><strong>Drop JSON files here</strong> or <span class="link">browse</span></p>
-        <p class="dz-hint">Each entry needs <code>uri</code>, <code>method</code>, <code>headers</code>, <code>params</code> / <code>request</code></p>
+    <div class="tab-bar" role="tablist">
+      <button class="tab-btn active" id="tabUpload" data-pane="paneUpload" type="button">📄 Upload files</button>
+      <button class="tab-btn" id="tabPaste" data-pane="panePaste" type="button">📝 Paste JSON</button>
+      <button class="tab-btn" id="tabMongo" data-pane="paneMongo" type="button">🍃 From MongoDB</button>
+    </div>
+    <div class="tab-pane" id="paneUpload">
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="fileInput" accept=".json,application/json" multiple hidden>
+        <div class="dz-inner">
+          <div class="dz-icon">📄</div>
+          <p><strong>Drop JSON files here</strong> or <span class="link">browse</span></p>
+          <p class="dz-hint">Each entry needs <code>uri</code>, <code>method</code>, <code>headers</code>, <code>params</code> / <code>request</code></p>
+        </div>
       </div>
+    </div>
+    <div class="tab-pane hidden" id="panePaste">
+      <textarea id="pasteInput" class="paste-area" spellcheck="false"
+        placeholder='Paste one request object or an array of them, e.g.
+
+{
+  "uri": "/api/v2/customers",
+  "method": "GET",
+  "headers": "Authorization: Bearer eyJ…",
+  "params": {}
+}
+
+— or —
+
+[{ "uri": "/health_check", "method": "GET", "headers": "", "params": {} }, …]'></textarea>
+      <div class="paste-actions">
+        <button class="ctrl-btn" id="pasteAddBtn" type="button">＋ Add to list</button>
+        <span class="paste-hint" id="pasteHint">Adds the pasted JSON as a virtual file (named <code>pasted-N.json</code>).</span>
+      </div>
+    </div>
+    <div class="tab-pane hidden" id="paneMongo">
+      <div class="mongo-grid">
+        <div class="field">
+          <label for="mongoUrl">MongoDB connection URL <span class="hint">scanned read-only; all collections are searched for each route's logs</span></label>
+          <input id="mongoUrl" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="mongodb://user:pass@host:27017/dbname">
+        </div>
+        <div class="field">
+          <label for="mongoModel">Filtering model <span class="hint">runs via your local <code>claude</code> CLI subscription — no API key needed</span></label>
+          <select id="mongoModel">
+            <option value="haiku" selected>claude haiku (fast &amp; cheap)</option>
+            <option value="sonnet">claude sonnet (better reasoning)</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label for="routesInput">Routes to test <span class="hint">one per line (or comma-separated, or a JSON array). e.g. <code>/meid</code>, <code>/address_sync</code></span></label>
+        <textarea id="routesInput" class="paste-area" spellcheck="false"
+          placeholder='/meid&#10;/set_sequence_route&#10;/address_sync&#10;/quotes&#10;…'></textarea>
+      </div>
+      <div class="paste-actions">
+        <button class="ctrl-btn" id="mongoBuildBtn" type="button">🔍 Fetch &amp; filter logs</button>
+        <button class="ctrl-btn danger hidden" id="mongoStopBtn" type="button">■ Stop</button>
+        <button class="ctrl-btn hidden" id="mongoRestartBtn" type="button">↻ Restart</button>
+        <span class="paste-hint" id="mongoHint">Fetches all logs per route, drops failures, then asks the AI to keep one example per distinct request variation.</span>
+      </div>
+      <div id="mongoProgress" class="mongo-progress hidden"></div>
     </div>
     <div id="fileList" class="file-list"></div>
   </section>
@@ -107,8 +161,19 @@
           <input id="startupTimeout" type="number" value="180" min="10">
         </div>
         <div class="field">
-          <label for="requestTimeout">Per-request timeout (s)</label>
-          <input id="requestTimeout" type="number" value="120" min="5">
+          <label for="requestTimeout">Per-request timeout (s) <span class="hint">heavy sync endpoints (e.g. /address_sync) can take minutes — raise this if requests time out</span></label>
+          <input id="requestTimeout" type="number" value="300" min="5">
+        </div>
+        <div class="field">
+          <label for="concurrency">Parallel requests <span class="hint">how many requests to replay at once on each branch — slow ones won't block fast ones</span></label>
+          <input id="concurrency" type="number" value="6" min="1" max="32">
+        </div>
+        <div class="field field-wide">
+          <label for="headerOverrides">Header overrides <span class="hint">forced on <strong>every</strong> replayed request — wins over whatever's in the log. One per line: <code>Name: value</code></span></label>
+          <textarea id="headerOverrides" class="paste-area" rows="4" spellcheck="false"
+            placeholder="X-Auth-Token: 5XT45x3b2OpJrQN58qrhgZf43pI4PRa32Z5JgN533pK7b43n3qNh45tj45Cu4l4x
+X-Api-Key: 2d1f05f134e341fb83a539a37aebeed0
+RequestCompanyId: 40"></textarea>
         </div>
       </div>
     </div>

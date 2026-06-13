@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Branch Compare — replay logged API requests against two git branches and diff the responses."""
+import ast
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -127,10 +129,44 @@ def detect_entry(src_dir):
 
 
 def parse_header_blob(blob):
+    """Accept any of:
+      - a dict already
+      - a JSON dict string, e.g. {"Authorization": "Bearer ..."}
+      - a Python-repr dict string (single-quoted) — our request-log capture
+        format dumps headers via str(dict), e.g.
+            {'Authorization': 'Bearer ...', 'X-Forwarded-For': '1.2.3.4'}
+      - a colon-separated text blob ("Header: value" per line).
+    Strips hop-by-hop headers that shouldn't be replayed.
+    """
     headers = {}
     if not blob:
         return headers
-    for line in re.split(r"\r?\n", blob):
+
+    parsed = None
+    if isinstance(blob, dict):
+        parsed = blob
+    elif isinstance(blob, str):
+        s = blob.strip()
+        if s.startswith("{"):
+            # Try JSON first, then Python literal (handles single-quoted dicts).
+            for loader in (json.loads, ast.literal_eval):
+                try:
+                    cand = loader(s)
+                    if isinstance(cand, dict):
+                        parsed = cand
+                        break
+                except (ValueError, SyntaxError):
+                    continue
+
+    if isinstance(parsed, dict):
+        for k, v in parsed.items():
+            k = str(k).strip()
+            if k and k.lower() not in SKIP_HEADERS:
+                headers[k] = str(v)
+        return headers
+
+    # Fallback: "Header: value" lines
+    for line in re.split(r"\r?\n", str(blob)):
         if ":" not in line:
             continue
         k, _, v = line.partition(":")
@@ -166,6 +202,254 @@ def parse_log_entries(raw, filename):
             "source": filename,
         })
     return specs
+
+
+# ---------------------------------------------------------------- mongo build
+
+# response_code values we treat as "the request actually worked" — anything
+# else (4xx/5xx, 405 method-not-allowed, 0/None) is dropped before the AI sees it.
+def _resp_code(doc):
+    for key in ("response_code", "status_code", "status"):
+        v = doc.get(key)
+        if v in (None, ""):
+            continue
+        try:
+            return int(str(v).strip())
+        except (ValueError, TypeError):
+            continue
+    # Some logs only carry the code inside the response JSON {"status": "200"}.
+    resp = doc.get("response")
+    if isinstance(resp, str) and resp.strip().startswith("{"):
+        try:
+            j = json.loads(resp)
+            if "status" in j:
+                return int(str(j["status"]).strip())
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _doc_is_success(doc):
+    code = _resp_code(doc)
+    return code is not None and 200 <= code < 300
+
+
+def normalize_route(route):
+    """Turn a user-supplied route token into a clean URI path.
+
+    Accepts 'meid', '/meid', 'config?', 'inventory/inventory_adjustment_from_job'.
+    Strips whitespace, comments, a trailing '?' (uncertainty marker), and
+    guarantees a single leading slash.
+    """
+    r = (route or "").strip()
+    if not r or r.startswith("#"):
+        return None
+    r = r.split()[0].strip()          # drop inline notes after whitespace
+    r = r.rstrip("?").strip()         # '?' marks "not sure" — ignore it
+    r = r.lstrip("/")
+    return "/" + r if r else None
+
+
+def parse_route_list(raw, filename=""):
+    """Parse a routes file (newline/CSV list, or a JSON array) into URI paths."""
+    raw = (raw or "").strip()
+    routes = []
+    if raw.startswith("[") or raw.startswith("{"):
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            data = data.get("routes") or data.get("uris") or list(data.values())
+        for item in data:
+            if isinstance(item, dict):
+                item = item.get("uri") or item.get("route") or item.get("path") or ""
+            r = normalize_route(str(item))
+            if r:
+                routes.append(r)
+    else:
+        # newline- and comma-separated tokens
+        for tok in re.split(r"[\n,]", raw):
+            r = normalize_route(tok)
+            if r:
+                routes.append(r)
+    # de-dup, keep order
+    seen, out = set(), []
+    for r in routes:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def _json_safe(doc):
+    """Strip Mongo-only types (ObjectId, datetime) so the doc is JSON-serializable."""
+    out = {}
+    for k, v in doc.items():
+        if k == "_id":
+            out[k] = str(v)
+        elif isinstance(v, (str, int, float, bool)) or v is None:
+            out[k] = v
+        elif isinstance(v, dict):
+            out[k] = _json_safe(v)
+        else:
+            out[k] = str(v)
+    return out
+
+
+def _log_signature(doc):
+    """A cheap structural fingerprint: method + the *shape* (keys) of params
+    and request body. Used to pre-group near-identical logs so the AI input
+    stays bounded even with 'no cap' fetching."""
+    method = (doc.get("method") or "GET").upper()
+
+    def keyshape(blob):
+        if not blob:
+            return ()
+        try:
+            obj = json.loads(blob) if isinstance(blob, str) else blob
+        except (ValueError, TypeError):
+            return ("_raw_",)
+        if isinstance(obj, dict):
+            return tuple(sorted(obj.keys()))
+        if isinstance(obj, list):
+            return ("_list_",)
+        return ("_scalar_",)
+
+    return (method, keyshape(doc.get("params")), keyshape(doc.get("request")))
+
+
+def _compact_log(n, doc):
+    """One-line, token-cheap summary of a log for the filtering agent."""
+    def trim(blob, limit=300):
+        s = "" if blob is None else str(blob)
+        return s if len(s) <= limit else s[:limit] + "…"
+    return (f"{n} | {(doc.get('method') or 'GET').upper()} {doc.get('uri','')} "
+            f"| params={trim(doc.get('params'))} "
+            f"| body={trim(doc.get('request'))}")
+
+
+AI_FILTER_SYSTEM_PROMPT = (
+    "You are a test-coverage curator for an API regression suite. You are given a "
+    "numbered list of real request logs that all hit the SAME endpoint. Your job is "
+    "to pick the SMALLEST subset of log numbers that still covers EVERY DISTINCT "
+    "VARIATION of the request.\n"
+    "\n"
+    "Two logs are the SAME variation if they exercise the same code path — i.e. the "
+    "same HTTP method and the same set of meaningful parameter/body fields (the "
+    "VALUES may differ; that does not matter). Keep exactly ONE representative per "
+    "distinct variation. If a field that selects behaviour differs (e.g. a 'type', "
+    "'action', 'mode', or which id-field is present), treat those as DIFFERENT "
+    "variations and keep one of each.\n"
+    "\n"
+    "Drop logs that look broken, empty, or malformed. Prefer keeping the log with the "
+    "richest/most-complete parameters when several are equivalent.\n"
+    "\n"
+    "Respond with ONLY a JSON array of the log numbers to keep, e.g. [1,4,12]. "
+    "No prose, no markdown, no explanation."
+)
+
+
+def ai_filter_logs(job, route, docs, max_to_ai=150):
+    """Ask Claude (via the local `claude` CLI) which numbered logs to keep,
+    streaming the model's output live into job.progress["ai_text"].
+
+    `docs` is the candidate list (already success-filtered). Returns the kept
+    docs. On any failure (or cancellation) falls back to a structural de-dup so
+    the pipeline never stalls. If the build is cancelled mid-stream the claude
+    subprocess is terminated so no further tokens are spent.
+    """
+    emit = job.emit
+    # Pre-group by structural signature so we never blow up the prompt. Keep up
+    # to a few representatives per signature; this already preserves variations.
+    groups = {}
+    for d in docs:
+        groups.setdefault(_log_signature(d), []).append(d)
+    reps = []
+    per_group = max(1, max_to_ai // max(1, len(groups)))
+    for sig, items in groups.items():
+        reps.extend(items[:per_group])
+    reps = reps[:max_to_ai]
+
+    if len(reps) <= 1:
+        return reps
+
+    numbered = [_compact_log(i + 1, d) for i, d in enumerate(reps)]
+    prompt = (f"Endpoint: {route}\nThere are {len(reps)} candidate logs.\n\n"
+              + "\n".join(numbered)
+              + "\n\nReturn the JSON array of log numbers to keep.")
+
+    job.progress["ai_route"] = route
+    job.progress["ai_text"] = ""
+    emit(f"[{route}] asking AI to filter {len(reps)} variation candidates…")
+
+    def fallback():
+        return [items[0] for items in groups.values()]
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            ["claude", "-p", "--model", job.model,
+             "--output-format", "stream-json", "--include-partial-messages",
+             "--verbose", "--no-session-persistence",
+             "--system-prompt", AI_FILTER_SYSTEM_PROMPT],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+        job.set_proc(proc)
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+
+        result_text = ""
+        deadline = time.time() + 180
+        for line in proc.stdout:
+            if job.cancelled:
+                job.kill_proc()
+                emit(f"[{route}] AI filtering cancelled — subprocess killed", "warn")
+                return fallback()
+            if time.time() > deadline:
+                job.kill_proc()
+                raise RuntimeError("claude timed out after 180s")
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            t = ev.get("type")
+            if t == "stream_event":
+                delta = ev.get("event", {}).get("delta", {})
+                chunk = delta.get("text")
+                if chunk:
+                    job.progress["ai_text"] += chunk
+            elif t == "result":
+                result_text = ev.get("result", "") or job.progress["ai_text"]
+
+        proc.wait()
+        if job.cancelled:
+            return fallback()
+        if proc.returncode != 0:
+            err = (proc.stderr.read() or "").strip()
+            raise RuntimeError(err or f"claude exited {proc.returncode}")
+
+        text = result_text or job.progress["ai_text"]
+        m = re.search(r"\[[\d,\s]*\]", text)
+        if not m:
+            raise RuntimeError(f"no number array in model output: {text[:200]}")
+        keep_nums = json.loads(m.group(0))
+        kept = [reps[n - 1] for n in keep_nums if 1 <= n <= len(reps)]
+        if not kept:
+            raise RuntimeError("model kept nothing")
+        emit(f"[{route}] AI kept {len(kept)}/{len(reps)} variations "
+             f"(from {len(docs)} success logs)", "ok")
+        return kept
+    except Exception as e:
+        if job.cancelled:
+            return fallback()
+        emit(f"[{route}] AI filter failed ({e}); falling back to structural de-dup", "warn")
+        return fallback()
+    finally:
+        job.set_proc(None)
+        job.progress["ai_route"] = None
+
 
 
 def normalize_body(text):
@@ -423,9 +707,19 @@ class BranchServer:
     def replay(self, spec):
         url = self.base_url + spec["uri"]
         timeout = int(self.cfg.get("request_timeout") or 120)
+        # Merge the per-job header overrides on top of whatever the log had.
+        # Overrides win — case-insensitive — so users can force a fresh
+        # X-Auth-Token / X-Api-Key / etc. regardless of stale values in logs.
+        overrides = self.cfg.get("_header_overrides_parsed") or {}
+        if overrides:
+            headers = {k: v for k, v in (spec["headers"] or {}).items()
+                       if k.lower() not in {o.lower() for o in overrides}}
+            headers.update(overrides)
+        else:
+            headers = spec["headers"]
         started = time.time()
         try:
-            kwargs = dict(headers=spec["headers"], params=spec["params"] or None,
+            kwargs = dict(headers=headers, params=spec["params"] or None,
                           verify=False, timeout=timeout)
             if spec["method"] in ("POST", "PUT", "PATCH", "DELETE") and spec["body"]:
                 kwargs["data"] = spec["body"].encode("utf-8")
@@ -570,6 +864,9 @@ def run_job(job):
         job.status = "running"
         job.emit(f"Comparing '{a}' vs '{b}' on {cfg['repo']} "
                  f"({len(cfg['requests'])} requests, both branches in parallel)")
+        overrides = cfg.get("_header_overrides_parsed") or {}
+        if overrides:
+            job.emit(f"Header overrides forced on every request: {', '.join(overrides.keys())}")
 
         # ---- 1. setup + start both branches in parallel
         job.progress.update(phase="setup", branch=None, done=0)
@@ -584,30 +881,33 @@ def run_job(job):
         if failed:
             raise RuntimeError(f"branch(es) failed to start: {', '.join(failed)}")
 
-        # ---- 2. replay each request on both branches in parallel; stream rows
+        # ---- 2. replay requests with a bounded concurrency pool.
+        # Each task hits BOTH branches in parallel; up to `concurrency` tasks
+        # run at once, so a slow endpoint (e.g. /address_sync) no longer blocks
+        # the rest of the queue. Rows are flushed into job.results strictly
+        # in-order so row numbers, the streaming table, and resume stay correct.
         job.progress["phase"] = "requests"
         specs = cfg["requests"]
         start_at = max(job.start_index, len(job.results))
         if start_at:
             job.emit(f"Resuming — skipping first {start_at} requests already completed")
-        for i in range(start_at, len(specs)):
-            # Cancellation: bail out cleanly before issuing the next request.
-            if job.cancelled:
-                job.emit("Stop requested — halting before next request", "warn")
-                break
-            # Pause: block here until resumed (or cancelled).
-            if job.paused:
-                job.emit("Paused", "warn")
-                while not job.pause_event.wait(timeout=0.5):
-                    if job.cancelled:
-                        break
-                if job.cancelled:
-                    job.emit("Stop requested while paused", "warn")
-                    break
-                job.emit("Resumed", "ok")
 
+        try:
+            concurrency = int(cfg.get("concurrency") or 6)
+        except (TypeError, ValueError):
+            concurrency = 6
+        concurrency = max(1, min(concurrency, 32))
+        job.emit(f"Replaying with concurrency={concurrency} "
+                 f"(each request runs on both branches in parallel)")
+
+        def process(i):
+            """Replay spec[i] on both branches. Honors pause/cancel."""
+            # Pause: park here until resumed (or cancelled).
+            while job.paused and not job.cancelled:
+                job.pause_event.wait(timeout=0.5)
+            if job.cancelled:
+                return i, None
             spec = specs[i]
-            job.progress["done"] = i
             results = {}
 
             def hit(br):
@@ -624,9 +924,34 @@ def run_job(job):
                 tag = "ok" if r["ok"] and (r["status"] or 0) < 500 else "warn"
                 job.emit(f"[{br}] {spec['method']} {spec['uri']} → "
                          f"{r['status']} ({r['time_ms']} ms)", tag)
-            job.results.append(_row_for(spec, ra, rb))
+            return i, _row_for(spec, ra, rb)
+
+        # Buffer out-of-order completions, flush the contiguous prefix in order.
+        buffer = {}
+        next_flush = start_at
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(process, i): i for i in range(start_at, len(specs))}
+            for fut in as_completed(futures):
+                i, row = fut.result()
+                completed += 1
+                if row is not None:
+                    buffer[i] = row
+                # Flush every contiguous row we now have.
+                while next_flush in buffer:
+                    job.results.append(buffer.pop(next_flush))
+                    next_flush += 1
+                # Progress bar tracks total completions (incl. in-flight order).
+                job.progress["done"] = start_at + completed
+
+        # Flush any remaining contiguous rows (e.g. all finished at once).
+        while next_flush in buffer:
+            job.results.append(buffer.pop(next_flush))
+            next_flush += 1
 
         job.progress["done"] = len(job.results)
+
 
         # ---- 3. final report (always written from whatever results we have)
         job.progress["phase"] = "report"
@@ -658,6 +983,197 @@ def run_job(job):
                 srv.cleanup()
             except Exception as e:
                 job.emit(f"[{br}] cleanup error: {e}", "warn")
+
+
+# ---------------------------------------------------------------- build job (mongo + AI)
+
+BUILDS = {}
+BUILDS_LOCK = threading.Lock()
+
+
+class BuildJob:
+    """Fetches logs from Mongo for a set of routes, AI-filters them down to the
+    distinct request variations, and emits a request-log JSON ready to replay."""
+
+    def __init__(self, mongo_url, routes, model, db_name=None):
+        self.id = uuid.uuid4().hex[:12]
+        self.mongo_url = mongo_url
+        self.routes = routes
+        self.model = model or "haiku"
+        self.db_name = db_name
+        self.status = "queued"
+        self.error = None
+        self.log = []
+        self.docs = []          # final kept logs (JSON-safe), ready to replay
+        self.per_route = []     # [{route, found, success, kept}]
+        self.progress = {
+            "phase": "queued", "route": None, "collection": None,
+            "done": 0, "total": len(routes),
+            "fetched": 0,       # cumulative docs pulled from Mongo (live)
+            "ai_route": None,   # route the AI is currently filtering
+            "ai_text": "",      # live streamed model output for that route
+        }
+        # Cancellation: cancel_event is set by /stop; the active claude
+        # subprocess (if any) is tracked so we can kill it and stop burning tokens.
+        self.cancel_event = threading.Event()
+        self._proc = None
+        self._proc_lock = threading.Lock()
+
+    @property
+    def cancelled(self):
+        return self.cancel_event.is_set()
+
+    def emit(self, msg, tag="info"):
+        self.log.append({"t": time.time(), "msg": msg, "tag": tag})
+
+    def set_proc(self, proc):
+        with self._proc_lock:
+            self._proc = proc
+
+    def kill_proc(self):
+        """Terminate any in-flight claude subprocess so AI tokens stop accruing."""
+        with self._proc_lock:
+            p = self._proc
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+                try:
+                    p.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+            except Exception:
+                pass
+
+    def cancel(self):
+        self.cancel_event.set()
+        self.kill_proc()
+
+    def to_dict(self):
+        return {
+            "id": self.id, "status": self.status, "error": self.error,
+            "cancelled": self.cancelled,
+            "progress": self.progress, "per_route": self.per_route,
+            "doc_count": len(self.docs), "log": self.log,
+        }
+
+
+def _iter_cursor(job, cursor):
+    """Yield docs from a Mongo cursor, bumping the live fetched counter and
+    bailing out fast if the build was cancelled."""
+    for doc in cursor:
+        if job.cancelled:
+            break
+        job.progress["fetched"] += 1
+        yield doc
+
+
+def run_build_job(job):
+    try:
+        from pymongo import MongoClient
+    except ImportError:
+        job.status = "error"
+        job.error = "pymongo is not installed (pip install pymongo dnspython)"
+        job.emit(job.error, "error")
+        return
+
+    client = None
+    try:
+        job.status = "running"
+        job.progress["phase"] = "connect"
+        job.emit("Connecting to MongoDB…")
+        client = MongoClient(job.mongo_url, serverSelectionTimeoutMS=8000)
+        # Pick the DB: explicit name, else the one in the URI, else first non-admin db.
+        db = None
+        if job.db_name:
+            db = client[job.db_name]
+        else:
+            try:
+                db = client.get_default_database()
+            except Exception:
+                db = None
+            if db is None:
+                names = [n for n in client.list_database_names()
+                         if n not in ("admin", "local", "config")]
+                if not names:
+                    raise RuntimeError("no usable database found in this Mongo URL")
+                db = client[names[0]]
+        collections = db.list_collection_names()
+        job.emit(f"Database '{db.name}' · {len(collections)} collection(s): "
+                 f"{', '.join(collections) or '(none)'}", "ok")
+
+        job.progress["phase"] = "fetch"
+        for idx, route in enumerate(job.routes):
+            if job.cancelled:
+                break
+            job.progress["route"] = route
+            job.progress["done"] = idx
+            # Gather candidate docs across every collection: exact uri match first,
+            # then a substring fallback if exact found nothing. Stream each
+            # cursor so the live "fetched" counter ticks up in real time.
+            found = []
+            for coll in collections:
+                if job.cancelled:
+                    break
+                job.progress["collection"] = coll
+                before = len(found)
+                for doc in _iter_cursor(job, db[coll].find({"uri": route})):
+                    found.append(doc)
+                got = len(found) - before
+                if got:
+                    job.emit(f"[{route}] {coll}: +{got} log(s) (total {len(found)})")
+            if not found and not job.cancelled:
+                job.emit(f"[{route}] no exact match — trying substring scan", "warn")
+                rx = {"uri": {"$regex": re.escape(route.lstrip("/")), "$options": "i"}}
+                for coll in collections:
+                    if job.cancelled:
+                        break
+                    job.progress["collection"] = coll
+                    for doc in _iter_cursor(job, db[coll].find(rx)):
+                        found.append(doc)
+            job.progress["collection"] = None
+
+            if job.cancelled:
+                break
+
+            success = [d for d in found if _doc_is_success(d)]
+            job.emit(f"[{route}] {len(found)} logs found · {len(success)} successful", "ok")
+
+            if not success:
+                job.per_route.append({"route": route, "found": len(found),
+                                      "success": 0, "kept": 0})
+                continue
+
+            job.progress["phase"] = "filter"
+            kept = ai_filter_logs(job, route, success)
+            if job.cancelled:
+                break
+            for d in kept:
+                safe = _json_safe(d)
+                safe["_route"] = route
+                job.docs.append(safe)
+            job.per_route.append({"route": route, "found": len(found),
+                                  "success": len(success), "kept": len(kept)})
+            job.progress["phase"] = "fetch"
+
+        if job.cancelled:
+            job.status = "stopped"
+            job.progress["phase"] = "stopped"
+            job.emit(f"Build stopped by user — {len(job.docs)} request(s) kept so far", "warn")
+        else:
+            job.progress["done"] = len(job.routes)
+            job.progress["phase"] = "done"
+            job.status = "done"
+            job.emit(f"Built {len(job.docs)} request(s) across {len(job.routes)} route(s) 🎉", "ok")
+    except Exception as e:
+        job.status = "error"
+        job.error = str(e)
+        job.emit(f"Build failed: {e}\n{traceback.format_exc()}", "error")
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------- API routes
@@ -732,6 +1248,64 @@ def parse_files():
     return jsonify({"requests": all_specs, "files": summary})
 
 
+@app.post("/api/mongo-build")
+def mongo_build():
+    """Kick off a background build: fetch logs from Mongo for the given routes,
+    AI-filter to distinct variations, then expose them as a replayable log set."""
+    body = request.json or {}
+    mongo_url = (body.get("mongo_url") or "").strip()
+    raw_routes = body.get("routes") or ""
+    model = (body.get("model") or "haiku").strip()
+    db_name = (body.get("db_name") or "").strip() or None
+    if not mongo_url:
+        return jsonify({"error": "missing 'mongo_url'"}), 400
+    try:
+        routes = parse_route_list(raw_routes)
+    except Exception as e:
+        return jsonify({"error": f"could not parse routes: {e}"}), 400
+    if not routes:
+        return jsonify({"error": "no routes found in input"}), 400
+    job = BuildJob(mongo_url, routes, model, db_name)
+    with BUILDS_LOCK:
+        BUILDS[job.id] = job
+    threading.Thread(target=run_build_job, args=(job,), daemon=True).start()
+    return jsonify({"build_id": job.id, "routes": routes})
+
+
+@app.get("/api/build/<build_id>")
+def build_status(build_id):
+    job = BUILDS.get(build_id)
+    if not job:
+        return jsonify({"error": "unknown build"}), 404
+    return jsonify(job.to_dict())
+
+
+@app.post("/api/build/<build_id>/stop")
+def build_stop(build_id):
+    """Cancel an in-flight build. Kills any running claude subprocess so no
+    further AI tokens are spent."""
+    job = BUILDS.get(build_id)
+    if not job:
+        return jsonify({"error": "unknown build"}), 404
+    if job.status not in ("running", "queued"):
+        return jsonify({"error": f"build is not running (status '{job.status}')"}), 400
+    job.cancel()
+    job.emit("Stop requested — cancelling…", "warn")
+    return jsonify({"ok": True, "cancelled": True})
+
+
+@app.get("/api/build/<build_id>/result")
+def build_result(build_id):
+    """The kept logs as a request-log JSON array, ready to feed into /api/parse.
+    Works for both completed and user-stopped builds (returns whatever was kept)."""
+    job = BUILDS.get(build_id)
+    if not job:
+        return jsonify({"error": "unknown build"}), 404
+    if job.status not in ("done", "stopped"):
+        return jsonify({"error": f"build not finished (status '{job.status}')"}), 400
+    return jsonify({"requests": job.docs, "count": len(job.docs)})
+
+
 @app.post("/api/run")
 def start_run():
     cfg = request.json
@@ -741,6 +1315,8 @@ def start_run():
     cfg["repo"] = os.path.expanduser(cfg["repo"])
     if not is_git_repo(cfg["repo"]):
         return jsonify({"error": "repo is not a git repository"}), 400
+    # Pre-parse header overrides once so replay() doesn't have to re-parse per request.
+    cfg["_header_overrides_parsed"] = parse_header_blob(cfg.get("header_overrides") or "")
     job = Job(cfg)
     with JOBS_LOCK:
         JOBS[job.id] = job
@@ -764,6 +1340,7 @@ def job_pause(job_id):
     if job.status != "running":
         return jsonify({"error": f"cannot pause job in status '{job.status}'"}), 400
     job.pause_event.clear()
+    job.emit("Paused — in-flight requests finish, no new ones start", "warn")
     return jsonify({"ok": True, "paused": True})
 
 
@@ -776,6 +1353,7 @@ def job_resume(job_id):
     if job.status != "running" or not job.paused:
         return jsonify({"error": f"job is not paused (status '{job.status}')"}), 400
     job.pause_event.set()
+    job.emit("Resumed", "ok")
     return jsonify({"ok": True, "paused": False})
 
 

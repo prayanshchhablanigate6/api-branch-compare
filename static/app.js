@@ -188,6 +188,148 @@ function renderFiles() {
     }));
 }
 
+/* ---- tab switcher (upload vs paste) ---- */
+document.querySelectorAll(".tab-btn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tab-btn").forEach((b) => b.classList.toggle("active", b === btn));
+    document.querySelectorAll(".tab-pane").forEach((p) =>
+      p.classList.toggle("hidden", p.id !== btn.dataset.pane));
+  });
+});
+
+/* ---- paste-JSON handler: adds the text as a synthetic "pasted-N.json" ---- */
+$("pasteAddBtn").addEventListener("click", async () => {
+  const txt = $("pasteInput").value.trim();
+  const hint = $("pasteHint");
+  if (!txt) { hint.textContent = "Paste some JSON first."; return; }
+  // Validate locally so we can show a friendly error before round-tripping.
+  try { JSON.parse(txt); }
+  catch (e) { hint.innerHTML = `<span class="err">invalid JSON: ${esc(e.message)}</span>`; return; }
+  // Pick a unique synthetic filename so multiple pastes coexist with uploads.
+  let n = 1;
+  while (state.files.some((f) => f.name === `pasted-${n}.json`)) n++;
+  const name = `pasted-${n}.json`;
+  state.files.push({ name, content: txt });
+  $("pasteInput").value = "";
+  hint.innerHTML = `Added as <code>${esc(name)}</code>.`;
+  try { await reparse(); } catch (e) { showFileError(e); }
+});
+
+/* ---- MongoDB build: fetch logs per route, AI-filter, inject as a file ---- */
+let mongoPoller = null;
+let mongoBuildId = null;
+
+function startMongoBuild() {
+  const url = $("mongoUrl").value.trim();
+  const routes = $("routesInput").value.trim();
+  const model = $("mongoModel").value;
+  const box = $("mongoProgress");
+  if (!url) { $("mongoHint").innerHTML = `<span class="err">Enter a MongoDB URL first.</span>`; return; }
+  if (!routes) { $("mongoHint").innerHTML = `<span class="err">Enter at least one route.</span>`; return; }
+
+  setMongoRunning(true);
+  box.classList.remove("hidden");
+  box.innerHTML = `<div class="mongo-status">Starting build…</div>`;
+  if (mongoPoller) clearInterval(mongoPoller);
+
+  fetch("/api/mongo-build", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mongo_url: url, routes, model }),
+  }).then(async (r) => {
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+    mongoBuildId = j.build_id;
+    mongoPoller = setInterval(() => pollMongo(mongoBuildId), 700);
+  }).catch((e) => {
+    box.innerHTML = `<div class="mongo-status err">Build failed to start: ${esc(e.message)}</div>`;
+    setMongoRunning(false);
+  });
+}
+
+async function pollMongo(buildId) {
+  try {
+    const r = await fetch(`/api/build/${buildId}`);
+    const b = await r.json();
+    renderMongoProgress(b);
+    if (b.status === "done" || b.status === "error" || b.status === "stopped") {
+      clearInterval(mongoPoller); mongoPoller = null;
+      setMongoRunning(false);
+      if (b.status === "done" || b.status === "stopped") await finishMongoBuild(buildId, b);
+    }
+  } catch (e) {
+    clearInterval(mongoPoller); mongoPoller = null;
+    setMongoRunning(false);
+    $("mongoProgress").innerHTML = `<div class="mongo-status err">Lost connection: ${esc(e.message)}</div>`;
+  }
+}
+
+function setMongoRunning(running) {
+  $("mongoBuildBtn").classList.toggle("hidden", running);
+  $("mongoStopBtn").classList.toggle("hidden", !running);
+  // Restart only shows after a build has finished/stopped (i.e. not running and we have an id).
+  $("mongoRestartBtn").classList.toggle("hidden", running || !mongoBuildId);
+}
+
+$("mongoBuildBtn").addEventListener("click", startMongoBuild);
+$("mongoRestartBtn").addEventListener("click", startMongoBuild);
+$("mongoStopBtn").addEventListener("click", async () => {
+  if (!mongoBuildId) return;
+  $("mongoStopBtn").disabled = true;
+  try {
+    await fetch(`/api/build/${mongoBuildId}/stop`, { method: "POST" });
+  } catch (e) { /* poller will surface the resulting state */ }
+  $("mongoStopBtn").disabled = false;
+});
+
+function renderMongoProgress(b) {
+  const box = $("mongoProgress");
+  const p = b.progress || {};
+  const phase = p.phase || b.status;
+  const stateClass = b.status === "error" ? "err" : (b.status === "stopped" ? "warn" : "");
+  let head;
+  if (b.status === "error") head = "✕ " + esc(b.error || "error");
+  else if (b.status === "stopped") head = `■ stopped · ${b.doc_count || 0} request(s) kept`;
+  else {
+    const where = p.collection ? ` · scanning <code>${esc(p.collection)}</code>` : "";
+    head = `${esc(phase)} · route ${p.done || 0}/${p.total || 0}`
+         + ` · <b>${p.fetched || 0}</b> logs fetched`
+         + ` · ${b.doc_count || 0} kept${where}`;
+  }
+
+  const rows = (b.per_route || []).map((r) =>
+    `<tr><td>${esc(r.route)}</td><td>${r.found}</td><td>${r.success}</td>
+       <td class="${r.kept ? "ok" : ""}">${r.kept}</td></tr>`).join("");
+
+  // Live AI stream for the route currently being filtered.
+  const aiBlock = (p.ai_route && p.ai_text)
+    ? `<div class="mongo-ai"><div class="mongo-ai-head">🤖 AI filtering <code>${esc(p.ai_route)}</code> — keeping:</div>
+         <pre class="mongo-ai-out">${esc(p.ai_text)}</pre></div>`
+    : "";
+
+  const lastLog = (b.log || []).slice(-8).map((l) =>
+    `<div class="ml ${esc(l.tag || "")}">${esc(l.msg)}</div>`).join("");
+
+  box.innerHTML = `
+    <div class="mongo-status ${stateClass}">${head}</div>
+    ${rows ? `<table class="mongo-table"><thead><tr><th>route</th><th>found</th><th>ok</th><th>kept</th></tr></thead><tbody>${rows}</tbody></table>` : ""}
+    ${aiBlock}
+    <div class="mongo-logs">${lastLog}</div>`;
+}
+
+async function finishMongoBuild(buildId, b) {
+  const r = await fetch(`/api/build/${buildId}/result`);
+  const j = await r.json();
+  if (!r.ok) { $("mongoProgress").innerHTML += `<div class="mongo-status err">${esc(j.error)}</div>`; return; }
+  if (!j.count) { $("mongoProgress").innerHTML += `<div class="mongo-status err">No matching logs were kept — check the routes / URL.</div>`; return; }
+  // Inject the kept logs as a synthetic file so the normal parse/run flow takes over.
+  const name = `mongo-build-${buildId}.json`;
+  state.files = state.files.filter((f) => !f.name.startsWith("mongo-build-"));
+  state.files.push({ name, content: JSON.stringify(j.requests) });
+  await reparse();
+  const note = b.status === "stopped" ? " (partial — build was stopped)" : "";
+  $("mongoProgress").innerHTML += `<div class="mongo-status ok">✓ Added ${j.count} request(s)${note} as <code>${esc(name)}</code> — proceed to pick branches &amp; run.</div>`;
+}
+
 /* ---------------- step 3: branches ---------------- */
 function branchItems(query) {
   if (!state.repo) return [];
@@ -238,7 +380,29 @@ function updateRunBar() {
 }
 
 /* ---------------- run + poll ---------------- */
+// Persist Advanced text fields across reloads so users don't lose their token
+// every time they refresh the page.
+const PERSIST_FIELDS = ["venvPython", "serverCmd", "baseUrl", "headerOverrides", "requestTimeout", "concurrency", "mongoUrl", "routesInput", "mongoModel"];
+for (const id of PERSIST_FIELDS) {
+  const el = $(id);
+  if (!el) continue;
+  const saved = localStorage.getItem("bc:" + id);
+  if (saved && !el.value) el.value = saved;
+  el.addEventListener("input", () => localStorage.setItem("bc:" + id, el.value));
+}
+
 $("runBtn").addEventListener("click", async () => {
+  const overrides = $("headerOverrides").value.trim();
+  if (!overrides) {
+    const proceed = confirm(
+      "⚠️  Header overrides is EMPTY.\n\n" +
+      "Most replayed requests will likely 401 because the auth token in your " +
+      "log file is expired. Add X-Auth-Token / X-Api-Key / requestcompanyid " +
+      "in Advanced › Header overrides.\n\n" +
+      "Continue anyway?"
+    );
+    if (!proceed) return;
+  }
   $("runBtn").disabled = true;
   const cfg = {
     repo: state.repo.repo,
@@ -249,6 +413,8 @@ $("runBtn").addEventListener("click", async () => {
     base_url: $("baseUrl").value.trim(),
     startup_timeout: +$("startupTimeout").value || 180,
     request_timeout: +$("requestTimeout").value || 120,
+    concurrency: +$("concurrency").value || 6,
+    header_overrides: $("headerOverrides").value,
   };
   const r = await fetch("/api/run", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg),
@@ -427,8 +593,12 @@ function renderReport(job) {
 
 function statusPill(r) {
   const s = r.status;
-  const cls = s == null ? "sx" : "s" + String(s)[0];
-  return `<span class="status-pill ${cls}">${s ?? "ERR"}</span><span class="ms">${r.time_ms} ms</span>`;
+  // Distinguish a read-timeout from a generic connection error so a merely
+  // slow endpoint doesn't look like a hard failure.
+  const isTimeout = s == null && /timed out|timeout/i.test(r.body || "");
+  const label = s ?? (isTimeout ? "TIMEOUT" : "ERR");
+  const cls = s == null ? (isTimeout ? "st" : "sx") : "s" + String(s)[0];
+  return `<span class="status-pill ${cls}">${label}</span><span class="ms">${r.time_ms} ms</span>`;
 }
 
 function drawRows() {

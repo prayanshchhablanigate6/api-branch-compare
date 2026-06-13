@@ -142,6 +142,7 @@ input:disabled { opacity: .45; cursor: not-allowed; }
 .chev { display: inline-block; transition: transform .2s; font-size: 12px; color: var(--muted); }
 .collapsible:not(.collapsed) .chev { transform: rotate(180deg); }
 .adv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.adv-grid .field-wide { grid-column: 1 / -1; }
 
 /* ---------- run bar ---------- */
 .run-bar {
@@ -200,6 +201,55 @@ input:disabled { opacity: .45; cursor: not-allowed; }
 .ctrl-btn.danger:hover:not(:disabled) { background: rgba(248,113,113,.18); }
 .ctrl-btn[hidden] { display: none; }
 
+/* ---------- tabs (step 2: upload / paste) ---------- */
+.tab-bar { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--card-edge); }
+.tab-btn {
+  font: inherit; font-size: 13px; font-weight: 600; padding: 8px 16px;
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+  border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color .15s, border-color .15s;
+}
+.tab-btn:hover { color: var(--fg); }
+.tab-btn.active { color: var(--fg); border-bottom-color: var(--accent, #60a5fa); }
+.tab-pane.hidden { display: none; }
+.paste-area {
+  width: 100%; min-height: 220px; font: 13px/1.45 var(--mono, monospace);
+  padding: 12px 14px; border-radius: 10px; resize: vertical;
+  background: var(--bg-soft); color: var(--fg);
+  border: 1px solid var(--card-edge); outline: none;
+}
+.paste-area:focus { border-color: rgba(96,165,250,.55); }
+.paste-actions { display: flex; gap: 12px; align-items: center; margin-top: 10px; }
+.paste-hint { font-size: 12px; color: var(--muted); }
+.paste-hint code { font-size: 11.5px; padding: 1px 5px; border-radius: 4px; background: rgba(255,255,255,.06); }
+
+/* ---- mongo build pane ---- */
+.mongo-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 12px; }
+.mongo-grid .field { margin: 0; }
+#paneMongo .paste-area { min-height: 150px; }
+#paneMongo select {
+  width: 100%; font: inherit; font-size: 13px; padding: 9px 12px; border-radius: 10px;
+  background: var(--bg-soft); color: var(--fg); border: 1px solid var(--card-edge); outline: none;
+}
+.mongo-progress { margin-top: 14px; padding: 12px 14px; border-radius: 10px;
+  background: var(--bg-soft); border: 1px solid var(--card-edge); }
+.mongo-progress.hidden { display: none; }
+.mongo-status { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+.mongo-status.ok { color: var(--ok); } .mongo-status.err { color: var(--err); }
+.mongo-table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin: 8px 0; }
+.mongo-table th, .mongo-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--card-edge); }
+.mongo-table th { color: var(--muted); font-weight: 600; }
+.mongo-table td.ok { color: var(--ok); font-weight: 600; }
+.mongo-logs { font: 11.5px/1.5 var(--mono, monospace); color: var(--muted); margin-top: 6px; }
+.mongo-logs .ml.ok { color: var(--ok); } .mongo-logs .ml.warn { color: var(--warn); }
+.mongo-logs .ml.error { color: var(--err); }
+.mongo-ai { margin: 10px 0; padding: 10px 12px; border-radius: 8px;
+  background: rgba(96,165,250,.06); border: 1px solid rgba(96,165,250,.25); }
+.mongo-ai-head { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.mongo-ai-head code { font-size: 11.5px; padding: 1px 5px; border-radius: 4px; background: rgba(255,255,255,.06); }
+.mongo-ai-out { font: 12px/1.5 var(--mono, monospace); color: var(--fg);
+  white-space: pre-wrap; word-break: break-word; margin: 0; max-height: 160px; overflow: auto; }
+
+
 /* ---------- report ---------- */
 .dl-btn {
   margin-left: auto; flex: none; text-decoration: none; font-size: 13px; font-weight: 700;
@@ -238,6 +288,7 @@ input:disabled { opacity: .45; cursor: not-allowed; }
 .status-pill { font-family: var(--mono); font-weight: 700; font-size: 12px; }
 .status-pill.s2 { color: var(--ok); } .status-pill.s4 { color: var(--warn); }
 .status-pill.s5, .status-pill.sx { color: var(--err); }
+.status-pill.st { color: var(--warn); }
 .ms { color: var(--muted); font-size: 11px; margin-left: 6px; }
 .match-badge { font-size: 15px; }
 .row-detail td { background: #0a0d13; padding: 16px; }
