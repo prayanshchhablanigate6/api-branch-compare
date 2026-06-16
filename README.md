@@ -40,3 +40,7 @@ or manually:
   the server command and timeouts.
 - Responses are compared as parsed JSON (key order/whitespace insensitive).
 - Run artifacts (server logs, `report.md`, `results.json`) land in `runs/<job-id>/`.
+- The Mongo log-filtering step uses **GitHub Copilot**. It reuses the OAuth token the
+  VS Code Copilot extension already caches at `~/.config/github-copilot/apps.json`, so
+  just sign in to Copilot in VS Code (Accounts → Sign in) — no API key and no Copilot
+  CLI required. Pick the model (GPT-4o / GPT-4.1 / o4-mini) in Advanced settings.

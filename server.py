@@ -326,6 +326,177 @@ def _compact_log(n, doc):
             f"| body={trim(doc.get('request'))}")
 
 
+# ---------------------------------------------------------------- copilot auth
+#
+# We talk to GitHub Copilot the same way the VS Code extension does — no Copilot
+# CLI required. The flow:
+#   1. Read the GitHub OAuth token the Copilot extension already cached locally
+#      (~/.config/github-copilot/apps.json, written when you sign in to Copilot
+#      in VS Code).
+#   2. Exchange it for a short-lived Copilot bearer token.
+#   3. Call the Copilot chat-completions endpoint with that bearer token.
+
+COPILOT_API_URL = "https://api.githubcopilot.com/chat/completions"
+COPILOT_MODELS_URL = "https://api.githubcopilot.com/models"
+COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
+# Official GitHub Copilot OAuth app — the same client id the editor plugins use.
+COPILOT_CLIENT_ID = "Iv1.b507a08c87ecfe98"
+GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
+GITHUB_OAUTH_TOKEN_URL = "https://github.com/login/oauth/access_token"
+COPILOT_APPS_JSON = Path.home() / ".config" / "github-copilot" / "apps.json"
+_COPILOT_EDITOR_VERSION = "vscode/1.95.0"
+_COPILOT_PLUGIN_VERSION = "copilot-chat/0.23.0"
+
+_copilot_token_cache = {"token": None, "expires_at": 0}
+_copilot_token_lock = threading.Lock()
+
+
+def _read_github_oauth_token():
+    """Return the GitHub OAuth token for Copilot.
+
+    Looks in (in order): the GITHUB_COPILOT_TOKEN env var, then the cache the
+    editor plugins / our own `--login` flow write to
+    ~/.config/github-copilot/{apps,hosts}.json.
+    """
+    env = os.environ.get("GITHUB_COPILOT_TOKEN") or os.environ.get("GH_COPILOT_TOKEN")
+    if env:
+        return env.strip()
+
+    candidates = [
+        COPILOT_APPS_JSON,
+        Path.home() / ".config" / "github-copilot" / "hosts.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except (ValueError, OSError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        for key, val in data.items():
+            if "github.com" in key and isinstance(val, dict) and val.get("oauth_token"):
+                return val["oauth_token"]
+    return None
+
+
+def _save_github_oauth_token(token):
+    """Persist a GitHub OAuth token in the location the editor plugins use, so
+    it's picked up on the next run without re-authenticating."""
+    COPILOT_APPS_JSON.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if COPILOT_APPS_JSON.exists():
+        try:
+            data = json.loads(COPILOT_APPS_JSON.read_text())
+            if not isinstance(data, dict):
+                data = {}
+        except (ValueError, OSError):
+            data = {}
+    data[f"github.com:{COPILOT_CLIENT_ID}"] = {"user": "", "oauth_token": token}
+    COPILOT_APPS_JSON.write_text(json.dumps(data, indent=2))
+    try:
+        os.chmod(COPILOT_APPS_JSON, 0o600)
+    except OSError:
+        pass
+
+
+def copilot_device_login():
+    """Run the GitHub OAuth device flow against the Copilot app and persist the
+    resulting token. Interactive: prints a URL + code for the user to enter in a
+    browser. Returns the oauth token. Requires no CLI — just a browser sign-in to
+    the GitHub account that holds the Copilot subscription."""
+    r = rq.post(
+        GITHUB_DEVICE_CODE_URL,
+        headers={"Accept": "application/json", "User-Agent": "GitHubCopilotChat/0.23.0"},
+        data={"client_id": COPILOT_CLIENT_ID, "scope": "read:user"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    dev = r.json()
+    device_code = dev["device_code"]
+    user_code = dev["user_code"]
+    verify_url = dev.get("verification_uri", "https://github.com/login/device")
+    interval = int(dev.get("interval", 5))
+    expires_in = int(dev.get("expires_in", 900))
+
+    print("\n  GitHub Copilot sign-in")
+    print(f"  1. Open: {verify_url}")
+    print(f"  2. Enter code: {user_code}\n")
+    print("  Waiting for authorization…", flush=True)
+
+    deadline = time.time() + expires_in
+    while time.time() < deadline:
+        time.sleep(interval)
+        pr = rq.post(
+            GITHUB_OAUTH_TOKEN_URL,
+            headers={"Accept": "application/json", "User-Agent": "GitHubCopilotChat/0.23.0"},
+            data={
+                "client_id": COPILOT_CLIENT_ID,
+                "device_code": device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            },
+            timeout=20,
+        )
+        body = pr.json()
+        if body.get("access_token"):
+            token = body["access_token"]
+            _save_github_oauth_token(token)
+            print(f"  Signed in — token saved to {COPILOT_APPS_JSON}\n")
+            return token
+        err = body.get("error")
+        if err == "authorization_pending":
+            continue
+        if err == "slow_down":
+            interval += int(body.get("interval", 5))
+            continue
+        raise RuntimeError(f"device login failed: {err or body}")
+    raise RuntimeError("device login timed out — please retry")
+
+
+def get_copilot_token():
+    """Exchange the local GitHub OAuth token for a short-lived Copilot bearer
+    token. Cached in-process until shortly before it expires."""
+    with _copilot_token_lock:
+        now = time.time()
+        cached = _copilot_token_cache
+        if cached["token"] and now < cached["expires_at"] - 60:
+            return cached["token"]
+
+        oauth = _read_github_oauth_token()
+        if not oauth:
+            raise RuntimeError(
+                "No GitHub Copilot credentials found. Authenticate once with: "
+                "`python server.py --login` (opens a browser sign-in to your "
+                "Copilot-enabled GitHub account — no CLI needed)."
+            )
+
+        r = rq.get(
+            COPILOT_TOKEN_URL,
+            headers={
+                "Authorization": f"token {oauth}",
+                "Editor-Version": _COPILOT_EDITOR_VERSION,
+                "Editor-Plugin-Version": _COPILOT_PLUGIN_VERSION,
+                "User-Agent": "GitHubCopilotChat/0.23.0",
+                "Accept": "application/json",
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Copilot token exchange failed ({r.status_code}): {r.text[:200]}. "
+                "Make sure your GitHub account has an active Copilot subscription "
+                "(re-run `python server.py --login` if the token expired)."
+            )
+        data = r.json()
+        token = data.get("token")
+        if not token:
+            raise RuntimeError("Copilot token exchange returned no token")
+        cached["token"] = token
+        cached["expires_at"] = float(data.get("expires_at") or (now + 1500))
+        return token
+
+
 AI_FILTER_SYSTEM_PROMPT = (
     "You are a test-coverage curator for an API regression suite. You are given a "
     "numbered list of real request logs that all hit the SAME endpoint. Your job is "
@@ -348,13 +519,16 @@ AI_FILTER_SYSTEM_PROMPT = (
 
 
 def ai_filter_logs(job, route, docs, max_to_ai=150):
-    """Ask Claude (via the local `claude` CLI) which numbered logs to keep,
-    streaming the model's output live into job.progress["ai_text"].
+    """Ask GitHub Copilot which numbered logs to keep, streaming the model's
+    output live into job.progress["ai_text"].
+
+    Uses the Copilot chat API directly (authenticated via the OAuth token the
+    VS Code Copilot extension caches locally) — no Copilot CLI required.
 
     `docs` is the candidate list (already success-filtered). Returns the kept
     docs. On any failure (or cancellation) falls back to a structural de-dup so
-    the pipeline never stalls. If the build is cancelled mid-stream the claude
-    subprocess is terminated so no further tokens are spent.
+    the pipeline never stalls. If the build is cancelled mid-stream the HTTP
+    response is closed so no further tokens are spent.
     """
     emit = job.emit
     # Pre-group by structural signature so we never blow up the prompt. Keep up
@@ -383,52 +557,64 @@ def ai_filter_logs(job, route, docs, max_to_ai=150):
     def fallback():
         return [items[0] for items in groups.values()]
 
-    proc = None
+    resp = None
     try:
-        proc = subprocess.Popen(
-            ["claude", "-p", "--model", job.model,
-             "--output-format", "stream-json", "--include-partial-messages",
-             "--verbose", "--no-session-persistence",
-             "--system-prompt", AI_FILTER_SYSTEM_PROMPT],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
+        token = get_copilot_token()
+        resp = rq.post(
+            COPILOT_API_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Copilot-Integration-Id": "vscode-chat",
+                "Editor-Version": _COPILOT_EDITOR_VERSION,
+                "Editor-Plugin-Version": _COPILOT_PLUGIN_VERSION,
+            },
+            json={
+                "model": job.model,
+                "messages": [
+                    {"role": "system", "content": AI_FILTER_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                "stream": True,
+                "temperature": 0,
+            },
+            stream=True,
+            timeout=180,
         )
-        job.set_proc(proc)
-        proc.stdin.write(prompt)
-        proc.stdin.close()
+        if resp.status_code != 200:
+            raise RuntimeError(f"copilot api {resp.status_code}: {resp.text[:200]}")
+        job.set_proc(resp)
 
         result_text = ""
         deadline = time.time() + 180
-        for line in proc.stdout:
+        for line in resp.iter_lines(decode_unicode=True):
             if job.cancelled:
-                job.kill_proc()
-                emit(f"[{route}] AI filtering cancelled — subprocess killed", "warn")
+                resp.close()
+                emit(f"[{route}] AI filtering cancelled — request closed", "warn")
                 return fallback()
             if time.time() > deadline:
-                job.kill_proc()
-                raise RuntimeError("claude timed out after 180s")
-            line = line.strip()
+                resp.close()
+                raise RuntimeError("copilot timed out after 180s")
             if not line:
+                continue
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if not line or line == "[DONE]":
                 continue
             try:
                 ev = json.loads(line)
             except ValueError:
                 continue
-            t = ev.get("type")
-            if t == "stream_event":
-                delta = ev.get("event", {}).get("delta", {})
-                chunk = delta.get("text")
-                if chunk:
-                    job.progress["ai_text"] += chunk
-            elif t == "result":
-                result_text = ev.get("result", "") or job.progress["ai_text"]
+            choices = ev.get("choices") or []
+            if not choices:
+                continue
+            chunk = (choices[0].get("delta") or {}).get("content")
+            if chunk:
+                job.progress["ai_text"] += chunk
+                result_text += chunk
 
-        proc.wait()
         if job.cancelled:
             return fallback()
-        if proc.returncode != 0:
-            err = (proc.stderr.read() or "").strip()
-            raise RuntimeError(err or f"claude exited {proc.returncode}")
 
         text = result_text or job.progress["ai_text"]
         m = re.search(r"\[[\d,\s]*\]", text)
@@ -447,6 +633,11 @@ def ai_filter_logs(job, route, docs, max_to_ai=150):
         emit(f"[{route}] AI filter failed ({e}); falling back to structural de-dup", "warn")
         return fallback()
     finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
         job.set_proc(None)
         job.progress["ai_route"] = None
 
@@ -999,7 +1190,7 @@ class BuildJob:
         self.id = uuid.uuid4().hex[:12]
         self.mongo_url = mongo_url
         self.routes = routes
-        self.model = model or "haiku"
+        self.model = model or "gpt-4o"
         self.db_name = db_name
         self.status = "queued"
         self.error = None
@@ -1013,8 +1204,8 @@ class BuildJob:
             "ai_route": None,   # route the AI is currently filtering
             "ai_text": "",      # live streamed model output for that route
         }
-        # Cancellation: cancel_event is set by /stop; the active claude
-        # subprocess (if any) is tracked so we can kill it and stop burning tokens.
+        # Cancellation: cancel_event is set by /stop; the active Copilot HTTP
+        # stream (if any) is tracked so we can close it and stop burning tokens.
         self.cancel_event = threading.Event()
         self._proc = None
         self._proc_lock = threading.Lock()
@@ -1031,18 +1222,26 @@ class BuildJob:
             self._proc = proc
 
     def kill_proc(self):
-        """Terminate any in-flight claude subprocess so AI tokens stop accruing."""
+        """Stop any in-flight AI work (close the Copilot HTTP stream, or
+        terminate a legacy subprocess) so no further tokens are spent."""
         with self._proc_lock:
             p = self._proc
-        if p and p.poll() is None:
-            try:
-                p.terminate()
-                try:
-                    p.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-            except Exception:
-                pass
+        if p is None:
+            return
+        try:
+            # subprocess.Popen-style handle
+            if hasattr(p, "poll") and hasattr(p, "terminate"):
+                if p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+            # requests.Response stream handle
+            elif hasattr(p, "close"):
+                p.close()
+        except Exception:
+            pass
 
     def cancel(self):
         self.cancel_event.set()
@@ -1248,6 +1447,57 @@ def parse_files():
     return jsonify({"requests": all_specs, "files": summary})
 
 
+@app.get("/api/copilot-models")
+def copilot_models():
+    """List the chat models available to this Copilot subscription, so the UI
+    dropdown can offer every model the CLI/editor would. Falls back to a small
+    static list if Copilot isn't reachable (e.g. not signed in yet)."""
+    fallback = [
+        {"id": "gpt-4o", "name": "GPT-4o"},
+        {"id": "gpt-4.1", "name": "GPT-4.1"},
+        {"id": "o4-mini", "name": "o4-mini"},
+    ]
+    try:
+        token = get_copilot_token()
+        r = rq.get(
+            COPILOT_MODELS_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Copilot-Integration-Id": "vscode-chat",
+                "Editor-Version": _COPILOT_EDITOR_VERSION,
+                "Editor-Plugin-Version": _COPILOT_PLUGIN_VERSION,
+            },
+            timeout=20,
+        )
+        if r.status_code != 200:
+            return jsonify({"models": fallback, "error": f"copilot api {r.status_code}"})
+        data = r.json().get("data") or []
+        seen, models = set(), []
+        for m in data:
+            mid = m.get("id")
+            if not mid or mid in seen:
+                continue
+            caps = m.get("capabilities") or {}
+            # Only chat-capable models make sense for the filtering step.
+            if caps.get("type") and caps.get("type") != "chat":
+                continue
+            # Respect Copilot's per-model enablement policy when present.
+            policy = (m.get("policy") or {}).get("state")
+            if policy and policy != "enabled":
+                continue
+            seen.add(mid)
+            models.append({
+                "id": mid,
+                "name": m.get("name") or mid,
+                "vendor": m.get("vendor") or "",
+            })
+        if not models:
+            models = fallback
+        return jsonify({"models": models})
+    except Exception as e:
+        return jsonify({"models": fallback, "error": str(e)})
+
+
 @app.post("/api/mongo-build")
 def mongo_build():
     """Kick off a background build: fetch logs from Mongo for the given routes,
@@ -1255,7 +1505,7 @@ def mongo_build():
     body = request.json or {}
     mongo_url = (body.get("mongo_url") or "").strip()
     raw_routes = body.get("routes") or ""
-    model = (body.get("model") or "haiku").strip()
+    model = (body.get("model") or "gpt-4o").strip()
     db_name = (body.get("db_name") or "").strip() or None
     if not mongo_url:
         return jsonify({"error": "missing 'mongo_url'"}), 400
@@ -1282,7 +1532,7 @@ def build_status(build_id):
 
 @app.post("/api/build/<build_id>/stop")
 def build_stop(build_id):
-    """Cancel an in-flight build. Kills any running claude subprocess so no
+    """Cancel an in-flight build. Closes any running Copilot request so no
     further AI tokens are spent."""
     job = BUILDS.get(build_id)
     if not job:
@@ -1410,6 +1660,10 @@ def report_md(job_id):
 
 
 if __name__ == "__main__":
+    import sys
+    if "--login" in sys.argv:
+        copilot_device_login()
+        sys.exit(0)
     port = int(os.environ.get("PORT", 5599))
     print(f"\n  Branch Compare running → http://127.0.0.1:{port}\n")
     app.run(host="127.0.0.1", port=port, debug=False, threaded=True)

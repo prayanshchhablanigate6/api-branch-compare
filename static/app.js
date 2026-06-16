@@ -391,6 +391,31 @@ for (const id of PERSIST_FIELDS) {
   el.addEventListener("input", () => localStorage.setItem("bc:" + id, el.value));
 }
 
+/* Populate the filtering-model dropdown from the live Copilot model list, so
+   every model the user's subscription exposes is selectable. Restores the
+   previously-saved selection if it's still available. */
+async function loadCopilotModels() {
+  const sel = $("mongoModel");
+  if (!sel) return;
+  const saved = localStorage.getItem("bc:mongoModel") || sel.value;
+  try {
+    const r = await fetch("/api/copilot-models");
+    const j = await r.json();
+    const models = j.models || [];
+    if (!models.length) return;
+    sel.innerHTML = models.map((m) =>
+      `<option value="${esc(m.id)}">${esc(m.name)}${m.vendor ? " · " + esc(m.vendor) : ""}</option>`
+    ).join("");
+    if (saved && models.some((m) => m.id === saved)) sel.value = saved;
+    if (j.error) console.warn("[copilot-models]", j.error);
+  } catch (e) {
+    console.warn("[copilot-models] failed to load:", e);
+  }
+}
+loadCopilotModels();
+// Refresh the list when the user opens the MongoDB tab (token may now be valid).
+$("tabMongo")?.addEventListener("click", loadCopilotModels);
+
 $("runBtn").addEventListener("click", async () => {
   const overrides = $("headerOverrides").value.trim();
   if (!overrides) {
